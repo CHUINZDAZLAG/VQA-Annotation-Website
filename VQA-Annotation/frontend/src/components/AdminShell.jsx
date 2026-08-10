@@ -1,0 +1,37 @@
+import React, { useState } from 'react';
+import { Link, useLocation, useNavigate, useOutletContext } from 'react-router-dom';
+import { authService } from '../services/authService';
+
+export default function AdminShell({ children, eyebrow, title, subtitle, actions }) {
+  const { user } = useOutletContext();
+  const location = useLocation();
+  const navigate = useNavigate();
+  const [collapsed, setCollapsed] = useState(false);
+  const [profileOpen, setProfileOpen] = useState(false);
+
+  async function logout() {
+    await authService.logout('admin');
+    navigate('/admin/login', { replace: true });
+  }
+
+  return (
+    <div className={`admin-shell ${collapsed ? 'admin-shell-collapsed' : ''}`}>
+      <aside className="admin-sidebar">
+        <div className="admin-brand"><img className="admin-logo" src="/Logo-DH-Cong-Nghe-Thong-Tin-UIT-V.webp" alt="VQA Annotation logo" /><div className="admin-brand-copy"><strong style={{ color: '#1769f5', fontSize: 16 }}>VQA Annotation</strong><p className="admin-muted" style={{ marginTop: 2 }}>Admin System</p></div></div>
+        <nav className="admin-nav">
+          <Link className={`admin-nav-link ${location.pathname === '/admin' ? 'active' : ''}`} to="/admin"><span className="admin-nav-icon">⌂</span><span>Dashboard</span></Link>
+          <Link className={`admin-nav-link ${location.pathname.startsWith('/admin/tasks') ? 'active' : ''}`} to="/admin/tasks"><span className="admin-nav-icon">▣</span><span>Task Management</span></Link>
+          <Link className={`admin-nav-link ${location.pathname.startsWith('/admin/users') ? 'active' : ''}`} to="/admin/users"><span className="admin-nav-icon">♧</span><span>User Management</span></Link>
+        </nav>
+        <div className="admin-profile-wrap"><button className="admin-profile" onClick={() => setProfileOpen(!profileOpen)} type="button"><span className="admin-avatar">{user.name?.[0]?.toUpperCase() ?? 'A'}</span><div className="admin-profile-copy" style={{ minWidth: 0, flex: 1 }}><strong style={{ display: 'block', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 11 }}>{user.name}</strong><span className="admin-eyebrow" style={{ fontSize: 10 }}>ADMIN</span></div><span style={{ color: '#52617a' }}>⌄</span></button>{profileOpen && <div className="admin-profile-menu"><button onClick={logout} type="button">↪ &nbsp; Logout</button></div>}</div>
+      </aside>
+      <div className="admin-main">
+        <header className="admin-topbar"><button className="admin-menu-button" aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'} onClick={() => setCollapsed(!collapsed)} type="button">☰</button><div style={{ display: 'flex', alignItems: 'center', gap: 18 }}><span style={{ color: '#52617a', fontSize: 20 }}>♧</span><button className="admin-top-profile" onClick={() => setProfileOpen(!profileOpen)} type="button"><span style={{ borderLeft: '1px solid #e7edf6', paddingLeft: 18, color: '#14213d', fontSize: 12, fontWeight: 700 }}>{user.name}<small className="admin-eyebrow" style={{ display: 'block', marginTop: 2, fontSize: 10 }}>ADMIN</small></span><span>⌄</span></button>{profileOpen && <div className="admin-top-profile-menu"><button onClick={logout} type="button">↪ &nbsp; Logout</button></div>}</div></header>
+        <main className="admin-content">
+          <div className="flex flex-wrap items-end justify-between gap-4"><div><p className="admin-eyebrow">{eyebrow}</p><h1 className="admin-title">{title}</h1><p className="admin-subtitle">{subtitle}</p></div>{actions}</div>
+          {children}
+        </main>
+      </div>
+    </div>
+  );
+}

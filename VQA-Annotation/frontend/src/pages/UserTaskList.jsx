@@ -1,0 +1,10 @@
+import React, { useEffect, useState } from 'react';
+import { Link } from 'react-router-dom';
+import { authService } from '../services/authService';
+import UserShell from '../components/UserShell';
+
+export default function UserTaskList() {
+  const [tasks, setTasks] = useState([]); const [error, setError] = useState('');
+  useEffect(() => { authService.listTasks().then(setTasks).catch((requestError) => setError(requestError.message)); }, []);
+  return <UserShell eyebrow="Workspace" title="My Tasks" subtitle="View and complete your assigned annotation tasks."><div className="user-task-list">{error && <p className="auth-error">{error}</p>}{tasks.map((task) => { const isMain = task.assignments.includes('MAIN_ANNOTATOR'); const isBlind = task.assignments.includes('BLIND_ANNOTATOR'); const isReviewer = task.assignments.includes('REVIEWER'); const hasDocument = task.document_page_count > 0; const workspace = isMain ? `/tasks/${task.id}/annotate` : isBlind ? `/tasks/${task.id}/blind` : isReviewer ? `/tasks/${task.id}/review` : `/tasks/${task.id}`; return <article className="admin-section user-task-card" key={task.id}><div className="flex flex-wrap items-center justify-between gap-3"><div><p className="admin-eyebrow">Task #{task.id}</p><h2 className="admin-section-title" style={{ marginTop: 5, fontSize: 19 }}>{task.name}</h2></div><Link className="admin-action admin-action-primary" to={workspace}>{isMain && hasDocument ? 'Continue annotation' : isMain ? 'Start annotation' : isBlind ? 'Open blind annotation' : isReviewer ? 'Open review' : 'Open task'} &nbsp;→</Link></div><p className="admin-subtitle" style={{ marginTop: 14 }}>{task.description || 'No description.'}</p><div className="user-task-meta"><span>Output Type: <strong>{task.output_type}</strong></span><span>Role: <strong>{task.assignments.join(', ')}</strong></span><span>Progress: <strong>{task.completed_slides} / {task.document_page_count} slides</strong></span><span>Status: <strong className="admin-status">{task.status}</strong></span></div></article>; })}{!tasks.length && !error && <div className="admin-section admin-muted">No assigned tasks.</div>}</div></UserShell>;
+}
