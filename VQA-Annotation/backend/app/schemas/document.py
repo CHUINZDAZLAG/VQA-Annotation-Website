@@ -121,6 +121,10 @@ class SlideAnnotationInput(BaseModel):
         return value.strip()
 
 
+class SlideAnnotationBatchInput(BaseModel):
+    annotations: list[SlideAnnotationInput] = Field(min_length=10, max_length=10)
+
+
 class DraftPositionInput(BaseModel):
     slide_id: int = Field(gt=0)
 

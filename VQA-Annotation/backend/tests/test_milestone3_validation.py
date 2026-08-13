@@ -11,7 +11,7 @@ from pydantic import ValidationError
 
 from app.models.task import OutputType, TaskStatus
 from app.routers.document import SLIDE_NAME_PATTERN, delete_draft_annotation, generated_image_id, render_and_upload_pages, validate_question
-from app.schemas.document import DriveDocumentSelection, DriveLinkInput, SlideAnnotationInput
+from app.schemas.document import DriveDocumentSelection, DriveLinkInput, SlideAnnotationBatchInput, SlideAnnotationInput
 from app.services.result_service import filename, final_dataset_records, flatten_record, fleiss_agreement_stats, serialize_records
 from app.services.gemini_service import generate_annotation, generate_annotations
 
@@ -101,6 +101,19 @@ class Milestone3ValidationTests(unittest.TestCase):
             SlideAnnotationInput(categories=1, slide_type=4, language=1, question={}, answer="A")
         with self.assertRaises(ValidationError):
             SlideAnnotationInput(categories=1, slide_type=1, language=3, question={}, answer="A")
+
+    def test_manual_json_batch_requires_exactly_ten_labels(self):
+        annotation = SlideAnnotationInput(
+            categories=0,
+            slide_type=1,
+            language=1,
+            question={"question_text": "Question"},
+            answer="A",
+        )
+        with self.assertRaises(ValidationError):
+            SlideAnnotationBatchInput(annotations=[annotation] * 9)
+        batch = SlideAnnotationBatchInput(annotations=[annotation] * 10)
+        self.assertEqual(len(batch.annotations), 10)
 
     def test_multiple_choice_requires_all_options_and_valid_answer(self):
         task = SimpleNamespace(output_type=OutputType.MULTIPLE_CHOICE)

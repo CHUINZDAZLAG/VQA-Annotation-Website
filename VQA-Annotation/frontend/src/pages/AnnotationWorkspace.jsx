@@ -16,6 +16,62 @@ const slideTypes = {
   3: "STARTUP_COMPETITION_SLIDE",
 };
 const languages = { 1: "English", 2: "Vietnamese" };
+const categoryValues = Object.fromEntries(
+  Object.entries(categories).map(([value, label]) => [label, Number(value)]),
+);
+const slideTypeValues = Object.fromEntries(
+  Object.entries(slideTypes).map(([value, label]) => [label, Number(value)]),
+);
+const languageValues = { ENGLISH: 1, VIETNAMESE: 2 };
+
+function manualJsonTemplate(outputType) {
+  const question = outputType === "MULTIPLE_CHOICE"
+    ? { question_text: "", option_a: "", option_b: "", option_c: "", option_d: "" }
+    : { question_text: "" };
+  return JSON.stringify({
+    annotations: Array.from({ length: 10 }, (_, index) => ({
+      category: index % 5,
+      slide_type: 1,
+      language: 1,
+      question,
+      answer: "",
+    })),
+  }, null, 2);
+}
+
+function normalizeEnum(value, names, fallback, field) {
+  if (value == null || value === "") return fallback;
+  if (typeof value === "number" || /^\d+$/.test(String(value))) return Number(value);
+  const normalized = names[String(value).trim().toUpperCase()];
+  if (normalized == null) throw new Error(`Unknown ${field} value: ${value}`);
+  return normalized;
+}
+
+function normalizeImportedAnnotation(annotation, outputType) {
+  if (!annotation || typeof annotation !== "object" || Array.isArray(annotation)) {
+    throw new Error("Each annotation must be a JSON object.");
+  }
+  const rawQuestion = annotation.question;
+  const question = typeof rawQuestion === "string"
+    ? { question_text: rawQuestion }
+    : { ...(rawQuestion || {}) };
+  if (outputType === "MULTIPLE_CHOICE") {
+    for (const letter of ["a", "b", "c", "d"]) {
+      question[`option_${letter}`] = question[`option_${letter}`] ?? question[`option_${letter.toUpperCase()}`] ?? "";
+      delete question[`option_${letter.toUpperCase()}`];
+    }
+  }
+  return {
+    categories: normalizeEnum(annotation.categories ?? annotation.category, categoryValues, 0, "category"),
+    slide_type: normalizeEnum(annotation.slide_type, slideTypeValues, 1, "slide_type"),
+    language: normalizeEnum(annotation.language, languageValues, 1, "language"),
+    question,
+    answer: String(annotation.answer ?? "").trim(),
+    insight: annotation.insight == null ? null : String(annotation.insight),
+    prompt: null,
+    edit_answer: annotation.edit_answer !== false,
+  };
+}
 
 function blankForm(outputType) {
   return {
@@ -68,6 +124,9 @@ export default function AnnotationWorkspace() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [generating, setGenerating] = useState(false);
+  const [creationMode, setCreationMode] = useState("GEMINI");
+  const [manualJson, setManualJson] = useState("");
+  const [expandedRows, setExpandedRows] = useState(() => new Set());
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
   const selectedSlide = slides[selectedIndex];
@@ -115,6 +174,7 @@ export default function AnnotationWorkspace() {
     let loadedImageUrl = "";
     if (!selectedSlide || !task) return undefined;
     setSelectedAnnotationIndex(0);
+    setExpandedRows(new Set());
     setForm(formFromAnnotation(selectedSlide.annotations?.[0], task.output_type));
     setFormDirty(false);
     authService.saveTaskDraftPosition(taskId, selectedSlide.id).catch(() => {});
@@ -262,6 +322,63 @@ export default function AnnotationWorkspace() {
     } finally {
       setGenerating(false);
     }
+  }
+  async function importCurrentJson() {
+    if (!selectedSlide) return;
+    setSaving(true);
+    setError("");
+    setMessage("");
+    try {
+      const parsed = JSON.parse(manualJson);
+      const items = Array.isArray(parsed) ? parsed : parsed.annotations;
+      if (!Array.isArray(items) || items.length !== 10) {
+        throw new Error('JSON must be an array of 10 labels or an object with exactly 10 items in "annotations".');
+      }
+      const importedAnnotations = await authService.importTaskSlideAnnotations(
+        taskId,
+        selectedSlide.id,
+        items.map((item) => normalizeImportedAnnotation(item, task.output_type)),
+      );
+      setSlides((current) => current.map((slide) => slide.id === selectedSlide.id
+        ? {
+            ...slide,
+            annotations: importedAnnotations,
+            annotation: importedAnnotations[0] || null,
+            status: importedAnnotations.every((annotation) => annotation.status === "COMPLETED")
+              ? "COMPLETED"
+              : "IN_PROGRESS",
+          }
+        : slide));
+      setSelectedAnnotationIndex(0);
+      setForm(formFromAnnotation(importedAnnotations[0], task.output_type));
+      setFormDirty(false);
+      setExpandedRows(new Set());
+      setMessage("10 JSON labels imported as drafts. Open any row to review or edit it.");
+    } catch (requestError) {
+      setError(requestError instanceof SyntaxError
+        ? `Invalid JSON: ${requestError.message}`
+        : requestError.message);
+    } finally {
+      setSaving(false);
+    }
+  }
+  async function toggleRow(index) {
+    const isExpanded = expandedRows.has(index);
+    if (!isExpanded && index !== selectedAnnotationIndex && !(await saveCurrent(false))) return;
+    setExpandedRows((current) => {
+      const next = new Set(current);
+      if (isExpanded) next.delete(index);
+      else next.add(index);
+      return next;
+    });
+    if (!isExpanded) setSelectedAnnotationIndex(index);
+  }
+  async function saveLabel(index) {
+    if (index !== selectedAnnotationIndex) {
+      setError("Select or edit this label before saving it.");
+      return;
+    }
+    await saveCurrent(true);
   }
   async function deleteAnnotation() {
     if (!selectedAnnotation?.id) return;
@@ -713,18 +830,65 @@ export default function AnnotationWorkspace() {
                 <span className="admin-status">{task.output_type}</span>
               </div>
               <div className="annotation-table-toolbar">
-                <span>Gemini creates all 10 labels in one request.</span>
-                <button className="admin-action admin-action-secondary" disabled={generating || saving} onClick={generateCurrent} type="button">
-                  {generating ? "Generating 10 labels..." : selectedAnnotations.length ? "Regenerate 10 labels" : "Generate 10 labels with Gemini"}
-                </button>
+                <div className="annotation-creation-tabs" role="tablist" aria-label="Label creation method">
+                  <button
+                    aria-selected={creationMode === "GEMINI"}
+                    className={creationMode === "GEMINI" ? "selected" : ""}
+                    onClick={() => setCreationMode("GEMINI")}
+                    role="tab"
+                    type="button"
+                  >
+                    Gemini
+                  </button>
+                  <button
+                    aria-selected={creationMode === "JSON"}
+                    className={creationMode === "JSON" ? "selected" : ""}
+                    onClick={() => {
+                      setCreationMode("JSON");
+                      if (!manualJson) setManualJson(manualJsonTemplate(task.output_type));
+                    }}
+                    role="tab"
+                    type="button"
+                  >
+                    Paste JSON
+                  </button>
+                </div>
+                {creationMode === "GEMINI" && (
+                  <button className="admin-action admin-action-secondary" disabled={generating || saving} onClick={generateCurrent} type="button">
+                    {generating ? "Generating 10 labels..." : selectedAnnotations.length ? "Regenerate 10 labels" : "Generate 10 labels with Gemini"}
+                  </button>
+                )}
               </div>
+              {creationMode === "JSON" && (
+                <div className="annotation-json-import">
+                  <div>
+                    <strong>Paste 10 labels as JSON</strong>
+                    <span>Accepts an array or {`{ "annotations": [...] }`}. Category and metadata may use numeric IDs or enum names.</span>
+                  </div>
+                  <textarea
+                    aria-label="JSON labels"
+                    rows="12"
+                    spellCheck="false"
+                    value={manualJson}
+                    onChange={(event) => setManualJson(event.target.value)}
+                  />
+                  <div className="annotation-json-import-actions">
+                    <button className="admin-action admin-action-secondary" onClick={() => setManualJson(manualJsonTemplate(task.output_type))} type="button">
+                      Reset template
+                    </button>
+                    <button className="admin-action admin-action-primary" disabled={saving} onClick={importCurrentJson} type="button">
+                      {saving ? "Importing..." : "Import 10 labels"}
+                    </button>
+                  </div>
+                </div>
+              )}
               <div className="annotation-label-table-wrap">
                 <table className="annotation-label-table">
                   <thead>
                     <tr>
                       <th>#</th>
-                      <th>Metadata</th>
-                      <th>Question JSON</th>
+                      <th>Category</th>
+                      <th>Question</th>
                       <th>Answer</th>
                       <th>Status</th>
                       <th aria-label="Actions" />
@@ -732,110 +896,77 @@ export default function AnnotationWorkspace() {
                   </thead>
                   <tbody>
                     {selectedAnnotations.map((annotation, index) => (
-                      <tr
-                        className={index === selectedAnnotationIndex ? "selected" : ""}
-                        key={annotation.id}
-                        onClick={() => selectAnnotation(index)}
-                      >
-                        <td>{index + 1}</td>
-                        <td>
-                          <div className="annotation-inline-fields">
-                            <label>
-                              <span>category</span>
-                              <select
-                                value={annotation.categories}
-                                onClick={(event) => event.stopPropagation()}
-                                onChange={updateInlineField(index, "categories")}
-                              >
-                                {Object.entries(categories).map(([value, label]) => (
-                                  <option value={value} key={value}>{label}</option>
-                                ))}
-                              </select>
-                            </label>
-                            <label>
-                              <span>slide_type</span>
-                              <select
-                                value={annotation.slide_type}
-                                onClick={(event) => event.stopPropagation()}
-                                onChange={updateInlineField(index, "slide_type")}
-                              >
-                                {Object.entries(slideTypes).map(([value, label]) => (
-                                  <option value={value} key={value}>{label}</option>
-                                ))}
-                              </select>
-                            </label>
-                            <label>
-                              <span>language</span>
-                              <select
-                                value={annotation.language}
-                                onClick={(event) => event.stopPropagation()}
-                                onChange={updateInlineField(index, "language")}
-                              >
-                                {Object.entries(languages).map(([value, label]) => (
-                                  <option value={value} key={value}>{label}</option>
-                                ))}
-                              </select>
-                            </label>
-                          </div>
-                        </td>
-                        <td>
-                          <div className="annotation-json-editor">
-                            <label>
-                              <span>"question_text":</span>
-                              <textarea
-                                rows="3"
-                                value={annotation.question?.question_text || ""}
-                                onClick={(event) => event.stopPropagation()}
-                                onChange={updateInlineQuestion(index, "question_text")}
-                              />
-                            </label>
-                            {isMultipleChoice && ["option_a", "option_b", "option_c", "option_d"].map((option) => (
-                              <label key={option}>
-                                <span>"{option}":</span>
-                                <textarea
-                                  rows="2"
-                                  value={annotation.question?.[option] || ""}
-                                  onClick={(event) => event.stopPropagation()}
-                                  onChange={updateInlineQuestion(index, option)}
-                                />
-                              </label>
-                            ))}
-                          </div>
-                        </td>
-                        <td>
-                          {isMultipleChoice ? (
-                            <select
-                              className="annotation-inline-answer"
-                              value={annotation.answer || ""}
-                              disabled={annotation.edit_answer === false}
-                              onClick={(event) => event.stopPropagation()}
-                              onChange={updateInlineField(index, "answer")}
-                            >
-                              <option value="">Select</option>
-                              {["A", "B", "C", "D"].map((answer) => (
-                                <option value={answer} key={answer}>{answer}</option>
-                              ))}
-                            </select>
-                          ) : (
-                            <textarea
-                              className="annotation-inline-answer"
-                              rows="4"
-                              value={annotation.answer || ""}
-                              disabled={annotation.edit_answer === false}
-                              onClick={(event) => event.stopPropagation()}
-                              onChange={updateInlineField(index, "answer")}
-                            />
-                          )}
-                        </td>
-                        <td><span className={`annotation-label-status ${annotation.status === "COMPLETED" ? "complete" : ""}`}>{annotation.status === "COMPLETED" ? "Complete" : "In progress"}</span></td>
-                        <td><button onClick={(event) => { event.stopPropagation(); selectAnnotation(index); }} type="button">Select</button></td>
-                      </tr>
+                      <React.Fragment key={annotation.id}>
+                        <tr className={expandedRows.has(index) ? "selected" : ""}>
+                          <td>{index + 1}</td>
+                          <td><span className="annotation-category-chip">{categories[annotation.categories] || annotation.categories}</span></td>
+                          <td><span className="annotation-question-summary">{annotation.question?.question_text || "Not entered"}</span></td>
+                          <td><strong>{annotation.answer || "-"}</strong></td>
+                          <td><span className={`annotation-label-status ${annotation.status === "COMPLETED" ? "complete" : ""}`}>{annotation.status === "COMPLETED" ? "Complete" : "In progress"}</span></td>
+                          <td><button aria-expanded={expandedRows.has(index)} onClick={() => toggleRow(index)} type="button">{expandedRows.has(index) ? "Collapse" : "View full / Edit"}</button></td>
+                        </tr>
+                        {expandedRows.has(index) && (
+                          <tr className="annotation-detail-row">
+                            <td colSpan="6">
+                              <div className="annotation-detail-editor">
+                                <div className="annotation-inline-fields">
+                                  <label>
+                                    <span>category</span>
+                                    <select value={annotation.categories} onChange={updateInlineField(index, "categories")}>
+                                      {Object.entries(categories).map(([value, label]) => <option value={value} key={value}>{label}</option>)}
+                                    </select>
+                                  </label>
+                                  <label>
+                                    <span>slide_type</span>
+                                    <select value={annotation.slide_type} onChange={updateInlineField(index, "slide_type")}>
+                                      {Object.entries(slideTypes).map(([value, label]) => <option value={value} key={value}>{label}</option>)}
+                                    </select>
+                                  </label>
+                                  <label>
+                                    <span>language</span>
+                                    <select value={annotation.language} onChange={updateInlineField(index, "language")}>
+                                      {Object.entries(languages).map(([value, label]) => <option value={value} key={value}>{label}</option>)}
+                                    </select>
+                                  </label>
+                                </div>
+                                <div className="annotation-json-editor">
+                                  <label>
+                                    <span>"question_text":</span>
+                                    <textarea rows="3" value={annotation.question?.question_text || ""} onChange={updateInlineQuestion(index, "question_text")} />
+                                  </label>
+                                  {isMultipleChoice && ["option_a", "option_b", "option_c", "option_d"].map((option) => (
+                                    <label key={option}>
+                                      <span>"{option}":</span>
+                                      <textarea rows="2" value={annotation.question?.[option] || ""} onChange={updateInlineQuestion(index, option)} />
+                                    </label>
+                                  ))}
+                                </div>
+                                <label className="annotation-detail-answer">
+                                  <span>answer</span>
+                                  {isMultipleChoice ? (
+                                    <select className="annotation-inline-answer" value={annotation.answer || ""} disabled={annotation.edit_answer === false} onChange={updateInlineField(index, "answer")}>
+                                      <option value="">Select</option>
+                                      {["A", "B", "C", "D"].map((answer) => <option value={answer} key={answer}>{answer}</option>)}
+                                    </select>
+                                  ) : (
+                                    <textarea className="annotation-inline-answer" rows="4" value={annotation.answer || ""} disabled={annotation.edit_answer === false} onChange={updateInlineField(index, "answer")} />
+                                  )}
+                                </label>
+                                <div className="annotation-detail-actions">
+                                  <button className="admin-action admin-action-secondary" onClick={() => toggleRow(index)} type="button">Collapse</button>
+                                  <button className="admin-action admin-action-primary" disabled={saving} onClick={() => saveLabel(index)} type="button">{saving && index === selectedAnnotationIndex ? "Saving..." : "Save label"}</button>
+                                </div>
+                              </div>
+                            </td>
+                          </tr>
+                        )}
+                      </React.Fragment>
                     ))}
                   </tbody>
                 </table>
               </div>
               {!selectedAnnotation && (
-                <p className="annotation-empty">No labels exist for this slide. Generate all 10 labels with Gemini to start.</p>
+                <p className="annotation-empty">No labels exist for this slide. Generate 10 labels with Gemini or import 10 labels from JSON to start.</p>
               )}
               {selectedAnnotation && (
                 <div className="annotation-row-actions">
@@ -843,16 +974,18 @@ export default function AnnotationWorkspace() {
                   <button disabled={saving} onClick={deleteAnnotation} type="button">Delete</button>
                 </div>
               )}
-              <label className="auth-label annotation-prompt-field">
-                Gemini prompt for the next 10-label generation (optional)
-                <textarea
-                  className="auth-input admin-textarea"
-                  rows="2"
-                  value={form.prompt || ""}
-                  onChange={updateField("prompt")}
-                  placeholder="Create a concise question focused on the key takeaway."
-                />
-              </label>
+              {creationMode === "GEMINI" && (
+                <label className="auth-label annotation-prompt-field">
+                  Gemini prompt for the next 10-label generation (optional)
+                  <textarea
+                    className="auth-input admin-textarea"
+                    rows="2"
+                    value={form.prompt || ""}
+                    onChange={updateField("prompt")}
+                    placeholder="Create a concise question focused on the key takeaway."
+                  />
+                </label>
+              )}
               <div className="annotation-form-actions">
                 <label className="annotation-readonly">
                   <input

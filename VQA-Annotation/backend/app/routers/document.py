@@ -19,7 +19,7 @@ from app.models.export import TaskExport
 from app.models.slide_annotation import SlideAnnotation
 from app.models.task import OutputType, Task, TaskStatus, TaskType
 from app.models.user import User
-from app.schemas.document import BlindAnnotationInput, DecisionInput, DocumentResponse, DraftPositionInput, DriveDocumentSelection, DriveLinkInput, GenerateAnnotationInput, SlideAnnotationInput, SlideAnnotationResponse, SlideResponse, SubmitResponse
+from app.schemas.document import BlindAnnotationInput, DecisionInput, DocumentResponse, DraftPositionInput, DriveDocumentSelection, DriveLinkInput, GenerateAnnotationInput, SlideAnnotationBatchInput, SlideAnnotationInput, SlideAnnotationResponse, SlideResponse, SubmitResponse
 from app.services import drive_service
 from app.services.gemini_service import generate_annotations
 from app.services.result_service import filename, final_dataset_records, serialize_records
@@ -505,6 +505,45 @@ def save_annotation(
         database_session.commit()
     database_session.refresh(annotation)
     return annotation
+
+
+@router.post("/{task_id}/slides/{slide_id}/annotations/import", response_model=list[SlideAnnotationResponse])
+def import_slide_annotations(
+    task_id: int,
+    slide_id: int,
+    payload: SlideAnnotationBatchInput,
+    current_user: MainAnnotator,
+    database_session: Session = Depends(get_db),
+) -> list[SlideAnnotation]:
+    existing_annotations = list(database_session.scalars(
+        select(SlideAnnotation).where(
+            SlideAnnotation.slide_id == slide_id,
+            SlideAnnotation.is_deleted.is_(False),
+        ).order_by(SlideAnnotation.id).limit(10)
+    ))
+    try:
+        imported_annotations = []
+        for index, imported in enumerate(payload.annotations):
+            existing = existing_annotations[index] if index < len(existing_annotations) else None
+            annotation_payload = imported.model_copy(update={
+                "annotation_id": existing.id if existing else None,
+                "question": normalized_question(imported.question),
+            })
+            imported_annotations.append(save_annotation(
+                task_id,
+                slide_id,
+                annotation_payload,
+                current_user,
+                database_session,
+                commit=False,
+            ))
+        database_session.commit()
+        for annotation in imported_annotations:
+            database_session.refresh(annotation)
+        return imported_annotations
+    except Exception:
+        database_session.rollback()
+        raise
 
 
 @router.post("/{task_id}/slides/{slide_id}/generate", response_model=list[SlideAnnotationResponse])

@@ -128,6 +128,9 @@ export const authService = {
   saveTaskSlideAnnotation: (taskId, slideId, payload) => request(`/api/tasks/${taskId}/slides/${slideId}/annotation`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
   }),
+  importTaskSlideAnnotations: (taskId, slideId, annotations) => request(`/api/tasks/${taskId}/slides/${slideId}/annotations/import`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ annotations }),
+  }),
   deleteTaskSlideAnnotation: (taskId, slideId, annotationId) => request(`/api/tasks/${taskId}/slides/${slideId}/annotations/${annotationId}`, {
     method: 'DELETE',
   }),
