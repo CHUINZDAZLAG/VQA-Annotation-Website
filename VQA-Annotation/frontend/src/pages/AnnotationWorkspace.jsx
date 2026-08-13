@@ -134,6 +134,7 @@ export default function AnnotationWorkspace() {
 
   useEffect(() => {
     if (!selectedSlide || !task) return;
+    if (formDirty) return;
     setForm(formFromAnnotation(selectedAnnotation, task.output_type));
     setFormDirty(false);
   }, [selectedAnnotationIndex, selectedAnnotation?.id, selectedSlide?.id, task?.output_type]);
@@ -148,11 +149,31 @@ export default function AnnotationWorkspace() {
     setFormDirty(true);
     setForm((current) => ({ ...current, [field]: event.target.value }));
   };
-  const updateQuestion = (field) => (event) => {
+  async function updateInlineAnnotation(annotationIndex, update) {
+    const annotation = selectedAnnotations[annotationIndex];
+    if (!annotation) return;
+    if (annotationIndex !== selectedAnnotationIndex && formDirty) {
+      const saved = await saveCurrent(false);
+      if (!saved) return;
+    }
+    const updated = update(formFromAnnotation(annotation, task.output_type));
+    updateSelectedSlide(updated, annotationIndex);
+    setSelectedAnnotationIndex(annotationIndex);
+    setForm(updated);
     setFormDirty(true);
-    setForm((current) => ({
-      ...current,
-      question: { ...current.question, [field]: event.target.value },
+  }
+  const updateInlineField = (annotationIndex, field) => (event) => {
+    const value = event.target.value;
+    updateInlineAnnotation(annotationIndex, (annotation) => ({
+      ...annotation,
+      [field]: value,
+    }));
+  };
+  const updateInlineQuestion = (annotationIndex, field) => (event) => {
+    const value = event.target.value;
+    updateInlineAnnotation(annotationIndex, (annotation) => ({
+      ...annotation,
+      question: { ...annotation.question, [field]: value },
     }));
   };
   function updateSelectedSlide(annotation, annotationIndex = selectedAnnotationIndex) {
@@ -641,6 +662,32 @@ export default function AnnotationWorkspace() {
               <span style={{ width: `${progress}%` }} />
             </div>
           </div>
+          <div className="annotation-navigation">
+            <button
+              className="admin-action admin-action-secondary"
+              disabled={selectedIndex === 0 || saving}
+              onClick={() => move(-1)}
+              type="button"
+            >
+              ← Previous
+            </button>
+            <label>
+              Slide
+              <select value={selectedIndex} onChange={(event) => selectSlide(Number(event.target.value))}>
+                {slides.map((slide, index) => (
+                  <option value={index} key={slide.id}>Page {slide.page_number} · {slide.image_id}</option>
+                ))}
+              </select>
+            </label>
+            <button
+              className="admin-action admin-action-primary"
+              disabled={selectedIndex === slides.length - 1 || saving}
+              onClick={() => move(1)}
+              type="button"
+            >
+              {saving ? "Saving..." : "Next →"}
+            </button>
+          </div>
           <div className="annotation-layout annotation-main-layout">
             <section className="annotation-preview">
               <img src={imageUrl} alt={selectedSlide.image_id} />
@@ -676,8 +723,8 @@ export default function AnnotationWorkspace() {
                   <thead>
                     <tr>
                       <th>#</th>
-                      <th>Category</th>
-                      <th>Question</th>
+                      <th>Metadata</th>
+                      <th>Question JSON</th>
                       <th>Answer</th>
                       <th>Status</th>
                       <th aria-label="Actions" />
@@ -691,11 +738,97 @@ export default function AnnotationWorkspace() {
                         onClick={() => selectAnnotation(index)}
                       >
                         <td>{index + 1}</td>
-                        <td>{categories[annotation.categories] || annotation.categories}</td>
-                        <td>{annotation.question?.question_text || "Not entered"}</td>
-                        <td>{annotation.answer || "-"}</td>
+                        <td>
+                          <div className="annotation-inline-fields">
+                            <label>
+                              <span>category</span>
+                              <select
+                                value={annotation.categories}
+                                onClick={(event) => event.stopPropagation()}
+                                onChange={updateInlineField(index, "categories")}
+                              >
+                                {Object.entries(categories).map(([value, label]) => (
+                                  <option value={value} key={value}>{label}</option>
+                                ))}
+                              </select>
+                            </label>
+                            <label>
+                              <span>slide_type</span>
+                              <select
+                                value={annotation.slide_type}
+                                onClick={(event) => event.stopPropagation()}
+                                onChange={updateInlineField(index, "slide_type")}
+                              >
+                                {Object.entries(slideTypes).map(([value, label]) => (
+                                  <option value={value} key={value}>{label}</option>
+                                ))}
+                              </select>
+                            </label>
+                            <label>
+                              <span>language</span>
+                              <select
+                                value={annotation.language}
+                                onClick={(event) => event.stopPropagation()}
+                                onChange={updateInlineField(index, "language")}
+                              >
+                                {Object.entries(languages).map(([value, label]) => (
+                                  <option value={value} key={value}>{label}</option>
+                                ))}
+                              </select>
+                            </label>
+                          </div>
+                        </td>
+                        <td>
+                          <div className="annotation-json-editor">
+                            <label>
+                              <span>"question_text":</span>
+                              <textarea
+                                rows="3"
+                                value={annotation.question?.question_text || ""}
+                                onClick={(event) => event.stopPropagation()}
+                                onChange={updateInlineQuestion(index, "question_text")}
+                              />
+                            </label>
+                            {isMultipleChoice && ["option_a", "option_b", "option_c", "option_d"].map((option) => (
+                              <label key={option}>
+                                <span>"{option}":</span>
+                                <textarea
+                                  rows="2"
+                                  value={annotation.question?.[option] || ""}
+                                  onClick={(event) => event.stopPropagation()}
+                                  onChange={updateInlineQuestion(index, option)}
+                                />
+                              </label>
+                            ))}
+                          </div>
+                        </td>
+                        <td>
+                          {isMultipleChoice ? (
+                            <select
+                              className="annotation-inline-answer"
+                              value={annotation.answer || ""}
+                              disabled={annotation.edit_answer === false}
+                              onClick={(event) => event.stopPropagation()}
+                              onChange={updateInlineField(index, "answer")}
+                            >
+                              <option value="">Select</option>
+                              {["A", "B", "C", "D"].map((answer) => (
+                                <option value={answer} key={answer}>{answer}</option>
+                              ))}
+                            </select>
+                          ) : (
+                            <textarea
+                              className="annotation-inline-answer"
+                              rows="4"
+                              value={annotation.answer || ""}
+                              disabled={annotation.edit_answer === false}
+                              onClick={(event) => event.stopPropagation()}
+                              onChange={updateInlineField(index, "answer")}
+                            />
+                          )}
+                        </td>
                         <td><span className={`annotation-label-status ${annotation.status === "COMPLETED" ? "complete" : ""}`}>{annotation.status === "COMPLETED" ? "Complete" : "In progress"}</span></td>
-                        <td><button onClick={(event) => { event.stopPropagation(); selectAnnotation(index); }} type="button">Edit</button></td>
+                        <td><button onClick={(event) => { event.stopPropagation(); selectAnnotation(index); }} type="button">Select</button></td>
                       </tr>
                     ))}
                   </tbody>
@@ -706,59 +839,12 @@ export default function AnnotationWorkspace() {
               )}
               {selectedAnnotation && (
                 <div className="annotation-row-actions">
-                  <span>Editing annotation {selectedAnnotationIndex + 1}</span>
+                  <span>Editing annotation {selectedAnnotationIndex + 1} directly in the table · changes auto-save</span>
                   <button disabled={saving} onClick={deleteAnnotation} type="button">Delete</button>
                 </div>
               )}
-              <div className="annotation-meta-grid">
-                <label className="auth-label">
-                  Category
-                  <select
-                    className="auth-input"
-                    value={form.categories}
-                    onChange={updateField("categories")}
-                  >
-                    {Object.entries(categories).map(([value, label]) => (
-                      <option value={value} key={value}>
-                        {label}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label className="auth-label">
-                  Slide Type
-                  <select
-                    className="auth-input"
-                    value={form.slide_type}
-                    onChange={updateField("slide_type")}
-                  >
-                    {Object.entries(slideTypes).map(([value, label]) => (
-                      <option value={value} key={value}>
-                        {label}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label className="auth-label">
-                  Language
-                  <select
-                    className="auth-input"
-                    value={form.language}
-                    onChange={updateField("language")}
-                  >
-                    {Object.entries(languages).map(([value, label]) => (
-                      <option value={value} key={value}>
-                        {label}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-              </div>
-              <p className="annotation-readonly">
-                Question Type: <strong>{task.output_type}</strong>
-              </p>
               <label className="auth-label annotation-prompt-field">
-                Gemini prompt (optional)
+                Gemini prompt for the next 10-label generation (optional)
                 <textarea
                   className="auth-input admin-textarea"
                   rows="2"
@@ -785,55 +871,6 @@ export default function AnnotationWorkspace() {
                   Allow answer editing
                 </label>
               </div>
-              <label className="auth-label">
-                Question
-                <textarea
-                  className="auth-input admin-textarea"
-                  rows="3"
-                  value={form.question.question_text}
-                  onChange={updateQuestion("question_text")}
-                />
-              </label>
-              {isMultipleChoice && (
-                <div className="annotation-options">
-                  {["option_a", "option_b", "option_c", "option_d"].map(
-                    (option) => (
-                      <label className="auth-label" key={option}>
-                        {option.replace("_", " ").toUpperCase()}
-                        <input
-                          className="auth-input"
-                          value={form.question[option]}
-                          onChange={updateQuestion(option)}
-                        />
-                      </label>
-                    ),
-                  )}
-                </div>
-              )}
-              <label className="auth-label">
-                Answer
-                {isMultipleChoice ? (
-                  <select
-                    className="auth-input"
-                    value={form.answer}
-                    disabled={form.edit_answer === false}
-                    onChange={updateField("answer")}
-                  >
-                    <option value="">Select answer</option>
-                    {["A", "B", "C", "D"].map((answer) => (
-                      <option key={answer}>{answer}</option>
-                    ))}
-                  </select>
-                ) : (
-                  <textarea
-                    className="auth-input admin-textarea"
-                    rows="2"
-                    value={form.answer}
-                    disabled={form.edit_answer === false}
-                    onChange={updateField("answer")}
-                  />
-                )}
-              </label>
               <div className="annotation-form-actions">
                 <button
                   className="admin-action admin-action-primary"
@@ -844,32 +881,6 @@ export default function AnnotationWorkspace() {
                 </button>
               </div>
             </form>
-          </div>
-          <div className="annotation-navigation">
-            <button
-              className="admin-action admin-action-secondary"
-              disabled={selectedIndex === 0 || saving}
-              onClick={() => move(-1)}
-              type="button"
-            >
-              ← Previous
-            </button>
-            <label>
-              Slide
-              <select value={selectedIndex} onChange={(event) => selectSlide(Number(event.target.value))}>
-                {slides.map((slide, index) => (
-                  <option value={index} key={slide.id}>Page {slide.page_number} · {slide.image_id}</option>
-                ))}
-              </select>
-            </label>
-            <button
-              className="admin-action admin-action-primary"
-              disabled={selectedIndex === slides.length - 1 || saving}
-              onClick={() => move(1)}
-              type="button"
-            >
-              {saving ? "Saving..." : "Next →"}
-            </button>
           </div>
           <div className="annotation-submit">
             <span>

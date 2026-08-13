@@ -24,6 +24,9 @@ def generate_annotations(
     category_name = {
         0: "CHART_ONLY", 1: "TEXT_ONLY", 2: "TABLE_ONLY", 3: "MIXED", 4: "INSIGHT",
     }[category]
+    category_guide = (
+        "0=CHART_ONLY, 1=TEXT_ONLY, 2=TABLE_ONLY, 3=MIXED, 4=INSIGHT"
+    )
     item_structure = (
         '{"category":0,"question":{"question_text":"...","option_A":"...","option_B":"...","option_C":"...","option_D":"..."},"answer":"A"}'
         if output_type == "MULTIPLE_CHOICE" else '{"category":0,"question":{"question_text":"..."},"answer":"..."}'
@@ -34,7 +37,9 @@ def generate_annotations(
         "contents": [{"parts": [
             {"text": (
                 f"Analyze only the provided slide image. {instruction} Generate exactly {count} distinct annotations.\n"
-                f"Language: {language_name}. Output type: {output_type}. Category: {category} ({category_name}). "
+                f"Language: {language_name}. Output type: {output_type}. Available categories: {category_guide}. "
+                f"Choose the most relevant category independently for each annotation and use a varied mix when "
+                f"the slide content supports it. Category {category} ({category_name}) is only a preference, not a requirement. "
                 f"Do not use Markdown or explanations. Return JSON only in this exact structure, with exactly {count} items: {structure}"
             )},
             {"inline_data": {"mime_type": "image/png", "data": base64.b64encode(image_bytes).decode("ascii")}},

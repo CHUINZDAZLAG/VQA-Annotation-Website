@@ -164,7 +164,9 @@ class Milestone3ValidationTests(unittest.TestCase):
         request_url = request_args[0]
         self.assertEqual(request_url, "https://generativelanguage.googleapis.com/v1beta/models/gemini-test:generateContent")
         self.assertEqual(request_kwargs["headers"], {"x-goog-api-key": "test-key"})
-        self.assertIn("Category: 0", request_kwargs["json"]["contents"][0]["parts"][0]["text"])
+        instruction = request_kwargs["json"]["contents"][0]["parts"][0]["text"]
+        self.assertIn("Choose the most relevant category independently", instruction)
+        self.assertIn("Category 0 (CHART_ONLY) is only a preference", instruction)
         self.assertNotIn("test-key", request_url)
 
     @patch("app.services.gemini_service.settings")
