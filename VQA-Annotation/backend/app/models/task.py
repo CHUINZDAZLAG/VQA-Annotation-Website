@@ -47,6 +47,9 @@ class Task(Base):
     )
     drive_folder_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     drive_folder_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    admin_drive_folder_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    annotator_drive_folder_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    current_slide_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

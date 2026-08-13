@@ -77,6 +77,9 @@ class TaskResponse(BaseModel):
     updated_at: datetime
     drive_folder_id: str | None = None
     drive_folder_url: str | None = None
+    admin_drive_folder_id: str | None = None
+    annotator_drive_folder_id: str | None = None
+    current_slide_id: int | None = None
     drive_link: str | None = None
     result_count: int = 0
     approved_count: int = 0

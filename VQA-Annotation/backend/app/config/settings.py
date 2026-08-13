@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     frontend_url: str = "http://localhost:5173"
     google_drive_service_account_file: str = ""
     gemini_api_key: str = ""
-    gemini_model: str = "gemini-1.5-flash"
+    gemini_model: str = "gemini-flash-latest"
     storage_root: str = "storage"
     max_pdf_size_mb: int = 0
 

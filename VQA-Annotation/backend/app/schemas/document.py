@@ -1,4 +1,5 @@
 from datetime import datetime
+import re
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
 
@@ -28,23 +29,29 @@ class DriveLinkInput(BaseModel):
     @field_validator("drive_link")
     @classmethod
     def validate_drive_link(cls, value: str) -> str:
+        value = value.strip()
+        if re.fullmatch(r"[A-Za-z0-9_-]+", value):
+            return value
         normalized = str(HttpUrl(value))
-        if not normalized.startswith(("http://", "https://")):
-            raise ValueError("drive_link must be an HTTP or HTTPS URL.")
+        if "drive.google.com/drive/folders/" not in normalized:
+            raise ValueError("drive_link must be a Google Drive folder ID or folder URL.")
         return normalized
 
 
 class DriveDocumentSelection(BaseModel):
     folder_id: str = Field(min_length=1, max_length=255)
     pdf_file_id: str = Field(min_length=1, max_length=255)
+    destination_folder_id: str | None = Field(default=None, min_length=1, max_length=255)
     slide_name: str = Field(min_length=1, max_length=255)
 
 
 class SlideResponse(BaseModel):
     id: int
+    annotation_id: int | None = None
     document_id: int
     page_number: int
     image_id: str
+    drive_folder_id: str | None = None
     drive_file_id: str | None = None
     drive_file_url: str | None = None
     slide_name: str
@@ -52,6 +59,7 @@ class SlideResponse(BaseModel):
     image_url: str
     status: SlideStatus
     annotation: "SlideAnnotationResponse | None" = None
+    annotations: list["SlideAnnotationResponse"] = Field(default_factory=list)
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -59,6 +67,9 @@ class SlideResponse(BaseModel):
 class SlideAnnotationResponse(BaseModel):
     id: int
     slide_id: int
+    annotation_record_id: int | None = None
+    publication_status: str = "DRAFT"
+    is_deleted: bool = False
     categories: int
     slide_type: int
     language: int
@@ -87,11 +98,12 @@ class SlideAnnotationResponse(BaseModel):
 
 
 class SlideAnnotationInput(BaseModel):
-    categories: int = Field(ge=1, le=4)
+    annotation_id: int | None = Field(default=None, gt=0)
+    categories: int = Field(ge=0, le=4)
     slide_type: int = Field(ge=1, le=3)
     language: int = Field(ge=1, le=2)
     question: dict
-    answer: str = Field(min_length=1, max_length=10000)
+    answer: str = Field(default="", max_length=10000)
     insight: str | None = Field(default=None, max_length=10000)
     prompt: str | None = Field(default=None, max_length=10000)
     edit_answer: bool = True
@@ -106,9 +118,11 @@ class SlideAnnotationInput(BaseModel):
     @field_validator("answer")
     @classmethod
     def answer_must_not_be_blank(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("Answer is required.")
         return value.strip()
+
+
+class DraftPositionInput(BaseModel):
+    slide_id: int = Field(gt=0)
 
 
 class BlindAnnotationInput(BaseModel):
@@ -124,8 +138,10 @@ class BlindAnnotationInput(BaseModel):
 
 
 class GenerateAnnotationInput(BaseModel):
+    annotation_id: int | None = Field(default=None, gt=0)
     prompt: str | None = Field(default=None, max_length=10000)
     language: int = Field(ge=1, le=2)
+    category: int = Field(default=0, ge=0, le=4)
     edit_answer: bool = True
 
 
@@ -136,8 +152,11 @@ class DecisionInput(BaseModel):
     @field_validator("reject_reason")
     @classmethod
     def reject_reason_required_for_rejection(cls, value: str | None, info) -> str | None:
-        if info.data.get("decision") == 0 and not value:
+        decision = info.data.get("decision")
+        if decision == 0 and not value:
             raise ValueError("Reject reason is required when decision is 0.")
+        if decision == 1 and value is not None:
+            raise ValueError("Reject reason must be empty when decision is 1.")
         if value and value not in {"CONTENT_MISMATCH", "SPELLING_ERROR", "FORMAT_ERROR", "OTHER"}:
             raise ValueError("Invalid reject reason.")
         return value

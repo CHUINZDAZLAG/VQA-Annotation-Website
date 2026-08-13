@@ -129,6 +129,7 @@ class TaskExportResponse(BaseModel):
     drive_file_url: str | None
     file_name: str
     format: str
+    status: str
     exported_at: datetime
 
     model_config = ConfigDict(from_attributes=True)

@@ -224,10 +224,29 @@ def get_statistics(task_id: int, _: AdminUser, database_session: Session = Depen
 def set_drive_folder(task_id: int, payload: DriveFolderUpdate, _: AdminUser,
                      database_session: Session = Depends(get_db)) -> dict:
     task = _task_or_404(database_session, task_id)
-    task.drive_folder_id = payload.drive_folder_id
-    task.drive_folder_url = payload.drive_folder_url
+    try:
+        from app.services import drive_service
+        folder_id = drive_service.verify_writable_folder(payload.drive_folder_id)
+    except Exception as error:
+        status_code = getattr(getattr(error, "resp", None), "status", None)
+        detail = (
+            "Google Drive permission denied. Please share the destination folder with the configured "
+            "Drive account with Editor access."
+            if status_code in {401, 403} or isinstance(error, PermissionError)
+            else str(error)
+        )
+        raise HTTPException(status_code=422, detail=detail) from error
+    task.admin_drive_folder_id = folder_id
+    if not task.annotator_drive_folder_id:
+        task.drive_folder_id = folder_id
+        task.drive_folder_url = drive_service.folder_url(folder_id)
     database_session.commit()
-    return {"task_id": task.id, "drive_folder_id": task.drive_folder_id, "drive_folder_url": task.drive_folder_url}
+    return {
+        "task_id": task.id,
+        "admin_drive_folder_id": task.admin_drive_folder_id,
+        "drive_folder_id": task.drive_folder_id,
+        "drive_folder_url": task.drive_folder_url,
+    }
 
 
 @router.get("/admin/tasks/{task_id}/exports", response_model=list[TaskExportResponse])
@@ -245,15 +264,18 @@ def export_task(task_id: int, payload: ExportRequest, _: AdminUser,
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Export format must be JSON or CSV.")
     records = final_dataset_records(_records(database_session, task_id))
     content, _ = serialize_records(records, output_format)
-    export = TaskExport(
-        task_id=task.id,
-        drive_folder_id=task.drive_folder_id,
-        file_name=filename(task.name, output_format),
-        format=output_format,
-    )
+    export = database_session.scalar(select(TaskExport).where(
+        TaskExport.task_id == task.id,
+        TaskExport.format == output_format,
+    ))
+    if export is None:
+        export = TaskExport(task_id=task.id, format=output_format)
+        database_session.add(export)
+    export.drive_folder_id = task.drive_folder_id
+    export.file_name = filename(task.name, output_format)
+    export.status = "EXPORTED"
     # Drive upload is intentionally backend-only; metadata remains usable when Drive is not configured.
     export.drive_file_id, export.drive_file_url = _upload_to_drive(task, export.file_name, content, output_format)
-    database_session.add(export)
     database_session.commit()
     database_session.refresh(export)
     return export

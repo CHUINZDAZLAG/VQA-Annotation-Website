@@ -117,15 +117,22 @@ export const authService = {
     method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ drive_link: driveLink }),
   }),
   getTaskSlides: (taskId) => request(`/api/tasks/${taskId}/slides`),
-  async uploadTaskDocument(taskId, file, slideName) {
+  async uploadTaskDocument(taskId, file, slideName, destinationDriveFolderId) {
     const formData = new FormData();
     formData.append('document', file);
     formData.append('slide_name', slideName);
+    if (destinationDriveFolderId) formData.append('destination_drive_folder_id', destinationDriveFolderId);
     return request(`/api/tasks/${taskId}/document`, { method: 'POST', body: formData });
   },
   getTaskSlide: (taskId, slideId) => request(`/api/tasks/${taskId}/slides/${slideId}`),
   saveTaskSlideAnnotation: (taskId, slideId, payload) => request(`/api/tasks/${taskId}/slides/${slideId}/annotation`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+  }),
+  deleteTaskSlideAnnotation: (taskId, slideId, annotationId) => request(`/api/tasks/${taskId}/slides/${slideId}/annotations/${annotationId}`, {
+    method: 'DELETE',
+  }),
+  saveTaskDraftPosition: (taskId, slideId) => request(`/api/tasks/${taskId}/draft-position`, {
+    method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ slide_id: slideId }),
   }),
   generateTaskSlideAnnotation: (taskId, slideId, payload) => request(`/api/tasks/${taskId}/slides/${slideId}/generate`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),

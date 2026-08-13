@@ -32,9 +32,9 @@ export default function BlindWorkspace() {
     setForm({ ...blankAnnotation(), ...(selectedSlide.blind_question || {}), answer: selectedSlide.blind_answer || '' });
     setDecision(selectedSlide.blind_label ?? null);
     setRejectReason(selectedSlide.reject_reason || '');
-    authService.getBlindSlideImage(taskId, selectedSlide.id).then((url) => active ? setImageUrl(url) : URL.revokeObjectURL(url)).catch((requestError) => active && setError(requestError.message));
+    authService.getBlindSlideImage(taskId, selectedSlide.slide_id).then((url) => active ? setImageUrl(url) : URL.revokeObjectURL(url)).catch((requestError) => active && setError(requestError.message));
     return () => { active = false; };
-  }, [taskId, selectedSlide?.id]);
+  }, [taskId, selectedSlide?.id, selectedSlide?.slide_id]);
 
   const update = (field) => (event) => setForm((current) => ({ ...current, [field]: event.target.value }));
   async function save() {

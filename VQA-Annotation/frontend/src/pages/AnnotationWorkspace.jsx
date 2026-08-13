@@ -4,10 +4,11 @@ import UserShell from "../components/UserShell";
 import { authService } from "../services/authService";
 
 const categories = {
+  0: "CHART_ONLY",
   1: "TEXT_ONLY",
-  2: "CHART_ONLY",
-  3: "TABLE_ONLY",
-  4: "MIXED",
+  2: "TABLE_ONLY",
+  3: "MIXED",
+  4: "INSIGHT",
 };
 const slideTypes = {
   1: "BUSINESS_AND_MARKETING_SLIDE",
@@ -18,7 +19,7 @@ const languages = { 1: "English", 2: "Vietnamese" };
 
 function blankForm(outputType) {
   return {
-    categories: 1,
+    categories: 0,
     slide_type: 1,
     language: 1,
     question: {
@@ -35,13 +36,14 @@ function blankForm(outputType) {
   };
 }
 
-function formFromSlide(slide, outputType) {
-  if (!slide?.annotation) return blankForm(outputType);
+function formFromAnnotation(annotation, outputType) {
+  if (!annotation) return blankForm(outputType);
   const empty = blankForm(outputType);
   return {
     ...empty,
-    ...slide.annotation,
-    question: { ...empty.question, ...(slide.annotation.question || {}) },
+    ...annotation,
+    annotation_id: annotation.id,
+    question: { ...empty.question, ...(annotation.question || {}) },
   };
 }
 
@@ -50,11 +52,16 @@ export default function AnnotationWorkspace() {
   const [task, setTask] = useState(null);
   const [slides, setSlides] = useState([]);
   const [selectedIndex, setSelectedIndex] = useState(0);
+  const [selectedAnnotationIndex, setSelectedAnnotationIndex] = useState(0);
   const [form, setForm] = useState(null);
+  const [formDirty, setFormDirty] = useState(false);
   const [imageUrl, setImageUrl] = useState("");
   const [uploadFile, setUploadFile] = useState(null);
   const [slideName, setSlideName] = useState("");
+  const [sourceMode, setSourceMode] = useState("UPLOAD");
   const [driveFolderId, setDriveFolderId] = useState("");
+  const [driveSourceFolderId, setDriveSourceFolderId] = useState("");
+  const [drivePdfInput, setDrivePdfInput] = useState("");
   const [drivePdfs, setDrivePdfs] = useState([]);
   const [selectedPdfId, setSelectedPdfId] = useState("");
   const [driveLink, setDriveLink] = useState("");
@@ -64,6 +71,8 @@ export default function AnnotationWorkspace() {
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
   const selectedSlide = slides[selectedIndex];
+  const selectedAnnotations = selectedSlide?.annotations || [];
+  const selectedAnnotation = selectedAnnotations[selectedAnnotationIndex] || null;
   const isMultipleChoice = task?.output_type === "MULTIPLE_CHOICE";
   const completedCount = slides.filter(
     (slide) => slide.status === "COMPLETED",
@@ -79,9 +88,13 @@ export default function AnnotationWorkspace() {
       const taskValue = await authService.getTask(taskId);
       setTask(taskValue);
       setDriveLink(taskValue.drive_link || taskValue.drive_folder_url || "");
+      setDriveFolderId(taskValue.annotator_drive_folder_id || taskValue.admin_drive_folder_id || taskValue.drive_folder_id || "");
       try {
         const slideValues = await authService.getTaskSlides(taskId);
         setSlides(slideValues);
+        const resumeIndex = slideValues.findIndex((slide) => slide.id === taskValue.current_slide_id);
+        setSelectedIndex(resumeIndex >= 0 ? resumeIndex : 0);
+        setSelectedAnnotationIndex(0);
         setSlideName(slideValues[0]?.slide_name || "");
       } catch (slideError) {
         if (!slideError.message.toLowerCase().includes("no document"))
@@ -99,52 +112,75 @@ export default function AnnotationWorkspace() {
   }, [taskId]);
   useEffect(() => {
     let active = true;
+    let loadedImageUrl = "";
     if (!selectedSlide || !task) return undefined;
-    setForm(formFromSlide(selectedSlide, task.output_type));
+    setSelectedAnnotationIndex(0);
+    setForm(formFromAnnotation(selectedSlide.annotations?.[0], task.output_type));
+    setFormDirty(false);
+    authService.saveTaskDraftPosition(taskId, selectedSlide.id).catch(() => {});
     authService
       .getTaskSlideImage(taskId, selectedSlide.id)
       .then((url) => {
+        loadedImageUrl = url;
         if (active) setImageUrl(url);
         else URL.revokeObjectURL(url);
       })
       .catch((requestError) => active && setError(requestError.message));
     return () => {
       active = false;
+      if (loadedImageUrl) URL.revokeObjectURL(loadedImageUrl);
     };
   }, [selectedIndex, selectedSlide?.id, task?.output_type, taskId]);
 
-  const updateField = (field) => (event) =>
+  useEffect(() => {
+    if (!selectedSlide || !task) return;
+    setForm(formFromAnnotation(selectedAnnotation, task.output_type));
+    setFormDirty(false);
+  }, [selectedAnnotationIndex, selectedAnnotation?.id, selectedSlide?.id, task?.output_type]);
+
+  useEffect(() => {
+    if (!form?.annotation_id || !formDirty || saving || generating) return undefined;
+    const timer = window.setTimeout(() => saveCurrent(false), 900);
+    return () => window.clearTimeout(timer);
+  }, [form, formDirty, selectedSlide?.id]);
+
+  const updateField = (field) => (event) => {
+    setFormDirty(true);
     setForm((current) => ({ ...current, [field]: event.target.value }));
-  const updateQuestion = (field) => (event) =>
+  };
+  const updateQuestion = (field) => (event) => {
+    setFormDirty(true);
     setForm((current) => ({
       ...current,
       question: { ...current.question, [field]: event.target.value },
     }));
-  function validate() {
-    if (!form?.question.question_text.trim())
-      return "Question text is required.";
-    if (isMultipleChoice) {
-      const missing = ["option_a", "option_b", "option_c", "option_d"].find(
-        (key) => !form.question[key].trim(),
-      );
-      if (missing) return `${missing.replace("_", " ")} is required.`;
-      if (!["A", "B", "C", "D"].includes(form.answer))
-        return "Answer must be A, B, C, or D.";
-    } else if (!form.answer.trim()) return "Answer is required.";
-    return null;
+  };
+  function updateSelectedSlide(annotation, annotationIndex = selectedAnnotationIndex) {
+    setSlides((current) =>
+      current.map((slide) => {
+        if (slide.id !== selectedSlide.id) return slide;
+        const annotations = [...(slide.annotations || [])];
+        annotations[annotationIndex] = annotation;
+        return {
+          ...slide,
+          annotations,
+          annotation: annotations[0] || null,
+          status: annotations.length === 10 && annotations.every((item) => item.status === "COMPLETED")
+            ? "COMPLETED"
+            : "IN_PROGRESS",
+        };
+      }),
+    );
   }
   async function saveCurrent(showMessage = true) {
-    const validationError = validate();
-    if (validationError) {
-      setError(validationError);
-      return false;
-    }
+    if (!selectedSlide || !form) return true;
     setSaving(true);
     try {
       const saved = await authService.saveTaskSlideAnnotation(
         taskId,
         selectedSlide.id,
         {
+          annotation_id: form.annotation_id || null,
           categories: Number(form.categories),
           slide_type: Number(form.slide_type),
           language: Number(form.language),
@@ -155,14 +191,10 @@ export default function AnnotationWorkspace() {
           edit_answer: form.edit_answer !== false,
         },
       );
-      setSlides((current) =>
-        current.map((slide) =>
-          slide.id === selectedSlide.id
-            ? { ...slide, status: saved.status, annotation: saved }
-            : slide,
-        ),
-      );
-      if (showMessage) setMessage("Annotation saved.");
+      updateSelectedSlide(saved);
+      setForm(formFromAnnotation(saved, task.output_type));
+      setFormDirty(false);
+      if (showMessage) setMessage(saved.status === "COMPLETED" ? "Draft saved." : "Incomplete draft saved.");
       setError("");
       return true;
     } catch (requestError) {
@@ -178,30 +210,64 @@ export default function AnnotationWorkspace() {
     setError("");
     setMessage("");
     try {
-      const generated = await authService.generateTaskSlideAnnotation(
+      const generatedAnnotations = await authService.generateTaskSlideAnnotation(
         taskId,
         selectedSlide.id,
         {
           prompt: form.prompt || null,
           language: Number(form.language),
+          category: Number(form.categories),
           edit_answer: form.edit_answer !== false,
         },
       );
-      setForm(formFromSlide({ annotation: generated }, task.output_type));
-      setSlides((current) =>
-        current.map((slide) =>
-          slide.id === selectedSlide.id
-            ? { ...slide, status: generated.status, annotation: generated }
-            : slide,
-        ),
-      );
+      setSlides((current) => current.map((slide) => slide.id === selectedSlide.id
+        ? {
+            ...slide,
+            annotations: generatedAnnotations,
+            annotation: generatedAnnotations[0] || null,
+            status: generatedAnnotations.every((annotation) => annotation.status === "COMPLETED")
+              ? "COMPLETED"
+              : "IN_PROGRESS",
+          }
+        : slide));
+      setSelectedAnnotationIndex(0);
+      setForm(formFromAnnotation(generatedAnnotations[0], task.output_type));
+      setFormDirty(false);
       setMessage(
-        "Gemini annotation generated. Review it before saving or moving on.",
+        "Gemini generated 10 labels for this slide. Review the table before publishing.",
       );
     } catch (requestError) {
       setError(requestError.message);
     } finally {
       setGenerating(false);
+    }
+  }
+  async function deleteAnnotation() {
+    if (!selectedAnnotation?.id) return;
+    setSaving(true);
+    setError("");
+    try {
+      await authService.deleteTaskSlideAnnotation(taskId, selectedSlide.id, selectedAnnotation.id);
+      const annotations = selectedAnnotations.filter((item) => item.id !== selectedAnnotation.id);
+      setSlides((current) => current.map((slide) => slide.id === selectedSlide.id
+        ? {
+            ...slide,
+            annotations,
+            annotation: annotations[0] || null,
+            status: annotations.length === 10 && annotations.every((item) => item.status === "COMPLETED")
+              ? "COMPLETED"
+              : "IN_PROGRESS",
+          }
+        : slide));
+      const nextIndex = Math.max(0, selectedAnnotationIndex - 1);
+      setSelectedAnnotationIndex(nextIndex);
+      setForm(formFromAnnotation(annotations[nextIndex], task.output_type));
+      setFormDirty(false);
+      setMessage("Draft annotation deleted.");
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setSaving(false);
     }
   }
   async function move(offset) {
@@ -215,6 +281,11 @@ export default function AnnotationWorkspace() {
     setMessage("");
     setSelectedIndex(index);
   }
+  async function selectAnnotation(index) {
+    if (index === selectedAnnotationIndex) return;
+    if (!(await saveCurrent(false))) return;
+    setSelectedAnnotationIndex(index);
+  }
   async function uploadDocument(event) {
     event.preventDefault();
     if (!uploadFile) {
@@ -225,12 +296,17 @@ export default function AnnotationWorkspace() {
       setError("Slide name is required.");
       return;
     }
+    if (!driveFolderId.trim()) {
+      setError("Destination Google Drive folder is required.");
+      return;
+    }
     setSaving(true);
     try {
       const response = await authService.uploadTaskDocument(
         taskId,
         uploadFile,
         slideName,
+        driveFolderId.trim(),
       );
       setSlides(response.slides);
       setSelectedIndex(0);
@@ -244,15 +320,15 @@ export default function AnnotationWorkspace() {
   }
   async function listDrivePdfs(event) {
     event.preventDefault();
-    if (!driveFolderId.trim()) {
-      setError("Google Drive folder ID or link is required.");
+    if (!driveSourceFolderId.trim()) {
+      setError("Enter a source Drive folder to list its PDFs.");
       return;
     }
     setSaving(true);
     try {
       const files = await authService.listTaskDrivePdfs(
         taskId,
-        driveFolderId.trim(),
+        driveSourceFolderId.trim(),
       );
       setDrivePdfs(files);
       setSelectedPdfId(files[0]?.id || "");
@@ -266,15 +342,17 @@ export default function AnnotationWorkspace() {
   }
   async function processDrivePdf(event) {
     event.preventDefault();
-    if (!selectedPdfId || !slideName.trim()) {
-      setError("Select a PDF and enter a slide name.");
+    const pdfFileId = drivePdfInput.trim() || selectedPdfId;
+    if (!pdfFileId || !slideName.trim() || !driveFolderId.trim()) {
+      setError("Enter a Drive PDF, slide name, and destination Drive folder.");
       return;
     }
     setSaving(true);
     try {
       const response = await authService.processTaskDrivePdf(taskId, {
-        folder_id: driveFolderId.trim(),
-        pdf_file_id: selectedPdfId,
+        folder_id: driveSourceFolderId.trim() || driveFolderId.trim(),
+        pdf_file_id: pdfFileId,
+        destination_folder_id: driveFolderId.trim(),
         slide_name: slideName.trim(),
       });
       setSlides(response.slides);
@@ -319,6 +397,7 @@ export default function AnnotationWorkspace() {
       );
       return;
     }
+    if (!(await saveCurrent(false))) return;
     try {
       await authService.submitTaskAnnotation(taskId);
       setTask((current) => ({ ...current, status: "SUBMITTED" }));
@@ -338,7 +417,7 @@ export default function AnnotationWorkspace() {
           {slides.length ? "Update PDF" : "Upload PDF"}
         </h2>
         <p className="admin-subtitle">
-          The PDF remains associated with this task when replaced.
+          Every generated page image is uploaded to the destination folder immediately.
         </p>
         <form onSubmit={uploadDocument}>
           <label className="auth-label">
@@ -361,6 +440,16 @@ export default function AnnotationWorkspace() {
               onChange={(event) => setSlideName(event.target.value)}
             />
           </label>
+          <label className="auth-label">
+            Destination Google Drive folder
+            <input
+              className="auth-input"
+              value={driveFolderId}
+              onChange={(event) => setDriveFolderId(event.target.value)}
+              placeholder="Folder ID or https://drive.google.com/drive/folders/..."
+              required
+            />
+          </label>
           <button
             className="admin-action admin-action-primary"
             style={{ marginTop: 24 }}
@@ -374,7 +463,7 @@ export default function AnnotationWorkspace() {
         </form>
       </section>
     ),
-    [slideName, uploadFile, saving, slides.length],
+    [slideName, uploadFile, driveFolderId, saving, slides.length],
   );
   const driveView = useMemo(
     () => (
@@ -384,31 +473,21 @@ export default function AnnotationWorkspace() {
           className="admin-section-title"
           style={{ marginTop: 6, fontSize: 20 }}
         >
-          Select PDF from Drive
+          Process PDF from Drive
         </h2>
-        <form onSubmit={listDrivePdfs}>
+        <form onSubmit={processDrivePdf}>
           <label className="auth-label">
-            Folder ID or link
+            Source PDF URL or file ID
             <input
               className="auth-input"
-              value={driveFolderId}
-              onChange={(event) => setDriveFolderId(event.target.value)}
-              placeholder="https://drive.google.com/drive/folders/..."
+              value={drivePdfInput}
+              onChange={(event) => setDrivePdfInput(event.target.value)}
+              placeholder="https://drive.google.com/file/d/.../view or FILE_ID"
             />
           </label>
-          <button
-            className="admin-action admin-action-secondary"
-            style={{ marginTop: 18 }}
-            disabled={saving}
-            type="submit"
-          >
-            List PDFs
-          </button>
-        </form>
-        {drivePdfs.length > 0 && (
-          <form onSubmit={processDrivePdf}>
+          {drivePdfs.length > 0 && (
             <label className="auth-label">
-              PDF file
+              Or select a listed PDF
               <select
                 className="auth-input"
                 value={selectedPdfId}
@@ -421,6 +500,7 @@ export default function AnnotationWorkspace() {
                 ))}
               </select>
             </label>
+          )}
             <label className="auth-label">
               Slide name
               <input
@@ -428,6 +508,16 @@ export default function AnnotationWorkspace() {
                 value={slideName}
                 onChange={(event) => setSlideName(event.target.value)}
                 placeholder="cake"
+                required
+              />
+            </label>
+            <label className="auth-label">
+              Destination Google Drive folder
+              <input
+                className="auth-input"
+                value={driveFolderId}
+                onChange={(event) => setDriveFolderId(event.target.value)}
+                placeholder="Folder ID or folder URL"
                 required
               />
             </label>
@@ -439,11 +529,24 @@ export default function AnnotationWorkspace() {
             >
               {saving ? "Processing..." : "Process selected PDF →"}
             </button>
-          </form>
-        )}
+        </form>
+        <form onSubmit={listDrivePdfs}>
+          <label className="auth-label">
+            Optional source folder for listing PDFs
+            <input
+              className="auth-input"
+              value={driveSourceFolderId}
+              onChange={(event) => setDriveSourceFolderId(event.target.value)}
+              placeholder="Source folder ID or URL"
+            />
+          </label>
+          <button className="admin-action admin-action-secondary" disabled={saving} type="submit">
+            List PDFs
+          </button>
+        </form>
       </section>
     ),
-    [driveFolderId, drivePdfs, selectedPdfId, slideName, saving],
+    [driveFolderId, driveSourceFolderId, drivePdfInput, drivePdfs, selectedPdfId, slideName, saving],
   );
   if (loading || (slides.length > 0 && !form))
     return (
@@ -471,17 +574,30 @@ export default function AnnotationWorkspace() {
         </p>
       )}
       {message && <p className="annotation-success">{message}</p>}
+      <div className="annotation-form-actions" style={{ justifyContent: "flex-start", marginTop: 18 }}>
+        <button
+          className={`admin-action ${sourceMode === "UPLOAD" ? "admin-action-primary" : "admin-action-secondary"}`}
+          onClick={() => setSourceMode("UPLOAD")}
+          type="button"
+        >
+          Upload PDF
+        </button>
+        <button
+          className={`admin-action ${sourceMode === "DRIVE" ? "admin-action-primary" : "admin-action-secondary"}`}
+          onClick={() => setSourceMode("DRIVE")}
+          type="button"
+        >
+          Google Drive PDF
+        </button>
+      </div>
       {!slides.length ? (
-        <>
-          <div className="annotation-toolbar">
-            {driveView}
-            {uploadView}
-          </div>
-        </>
+        <div className="annotation-toolbar">
+          {sourceMode === "UPLOAD" ? uploadView : driveView}
+        </div>
       ) : (
         <>
           <div className="annotation-toolbar">
-            {driveView}
+            {sourceMode === "UPLOAD" ? uploadView : driveView}
             <form
               className="admin-form-card annotation-upload-card"
               onSubmit={saveDriveLink}
@@ -525,28 +641,7 @@ export default function AnnotationWorkspace() {
               <span style={{ width: `${progress}%` }} />
             </div>
           </div>
-          <div className="annotation-layout">
-            <aside className="annotation-slide-list">
-              <h2 className="admin-section-title">Slides</h2>
-              {slides.map((slide, index) => (
-                <button
-                  className={`annotation-slide-item ${index === selectedIndex ? "selected" : ""}`}
-                  key={slide.id}
-                  onClick={() => selectSlide(index)}
-                  type="button"
-                >
-                  <span className="annotation-slide-check">
-                    {slide.status === "COMPLETED"
-                      ? "✓"
-                      : index === selectedIndex
-                        ? "●"
-                        : "○"}
-                  </span>
-                  <span>Page {String(slide.page_number).padStart(2, "0")}</span>
-                  <small>{slide.image_id}</small>
-                </button>
-              ))}
-            </aside>
+          <div className="annotation-layout annotation-main-layout">
             <section className="annotation-preview">
               <img src={imageUrl} alt={selectedSlide.image_id} />
               <div>
@@ -565,11 +660,56 @@ export default function AnnotationWorkspace() {
             >
               <div className="annotation-form-header">
                 <div>
-                  <h2 className="admin-section-title">Annotation</h2>
-                  <p className="admin-muted">{selectedSlide.image_id}</p>
+                  <h2 className="admin-section-title">Labels for current slide</h2>
+                  <p className="admin-muted">{selectedAnnotations.length} / 10 labels · {selectedSlide.image_id}</p>
                 </div>
                 <span className="admin-status">{task.output_type}</span>
               </div>
+              <div className="annotation-table-toolbar">
+                <span>Gemini creates all 10 labels in one request.</span>
+                <button className="admin-action admin-action-secondary" disabled={generating || saving} onClick={generateCurrent} type="button">
+                  {generating ? "Generating 10 labels..." : selectedAnnotations.length ? "Regenerate 10 labels" : "Generate 10 labels with Gemini"}
+                </button>
+              </div>
+              <div className="annotation-label-table-wrap">
+                <table className="annotation-label-table">
+                  <thead>
+                    <tr>
+                      <th>#</th>
+                      <th>Category</th>
+                      <th>Question</th>
+                      <th>Answer</th>
+                      <th>Status</th>
+                      <th aria-label="Actions" />
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {selectedAnnotations.map((annotation, index) => (
+                      <tr
+                        className={index === selectedAnnotationIndex ? "selected" : ""}
+                        key={annotation.id}
+                        onClick={() => selectAnnotation(index)}
+                      >
+                        <td>{index + 1}</td>
+                        <td>{categories[annotation.categories] || annotation.categories}</td>
+                        <td>{annotation.question?.question_text || "Not entered"}</td>
+                        <td>{annotation.answer || "-"}</td>
+                        <td><span className={`annotation-label-status ${annotation.status === "COMPLETED" ? "complete" : ""}`}>{annotation.status === "COMPLETED" ? "Complete" : "In progress"}</span></td>
+                        <td><button onClick={(event) => { event.stopPropagation(); selectAnnotation(index); }} type="button">Edit</button></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              {!selectedAnnotation && (
+                <p className="annotation-empty">No labels exist for this slide. Generate all 10 labels with Gemini to start.</p>
+              )}
+              {selectedAnnotation && (
+                <div className="annotation-row-actions">
+                  <span>Editing annotation {selectedAnnotationIndex + 1}</span>
+                  <button disabled={saving} onClick={deleteAnnotation} type="button">Delete</button>
+                </div>
+              )}
               <div className="annotation-meta-grid">
                 <label className="auth-label">
                   Category
@@ -617,7 +757,7 @@ export default function AnnotationWorkspace() {
               <p className="annotation-readonly">
                 Question Type: <strong>{task.output_type}</strong>
               </p>
-              <label className="auth-label">
+              <label className="auth-label annotation-prompt-field">
                 Gemini prompt (optional)
                 <textarea
                   className="auth-input admin-textarea"
@@ -628,27 +768,18 @@ export default function AnnotationWorkspace() {
                 />
               </label>
               <div className="annotation-form-actions">
-                <button
-                  className="admin-action admin-action-secondary"
-                  disabled={generating || saving}
-                  onClick={generateCurrent}
-                  type="button"
-                >
-                  {generating
-                    ? "Generating..."
-                    : selectedSlide.annotation
-                      ? "Regenerate with Gemini"
-                      : "Generate with Gemini"}
-                </button>
                 <label className="annotation-readonly">
                   <input
                     type="checkbox"
                     checked={form.edit_answer !== false}
                     onChange={(event) =>
-                      setForm((current) => ({
-                        ...current,
-                        edit_answer: event.target.checked,
-                      }))
+                      {
+                        setFormDirty(true);
+                        setForm((current) => ({
+                          ...current,
+                          edit_answer: event.target.checked,
+                        }));
+                      }
                     }
                   />{" "}
                   Allow answer editing
@@ -705,30 +836,40 @@ export default function AnnotationWorkspace() {
               </label>
               <div className="annotation-form-actions">
                 <button
-                  className="admin-action admin-action-secondary"
-                  disabled={selectedIndex === 0 || saving}
-                  onClick={() => move(-1)}
-                  type="button"
-                >
-                  ← Previous
-                </button>
-                <button
                   className="admin-action admin-action-primary"
                   disabled={saving}
                   type="submit"
                 >
-                  {saving ? "Saving..." : "Save Annotation"}
-                </button>
-                <button
-                  className="admin-action admin-action-secondary"
-                  disabled={selectedIndex === slides.length - 1 || saving}
-                  onClick={() => move(1)}
-                  type="button"
-                >
-                  Next →
+                  {saving ? "Saving..." : "Save Draft"}
                 </button>
               </div>
             </form>
+          </div>
+          <div className="annotation-navigation">
+            <button
+              className="admin-action admin-action-secondary"
+              disabled={selectedIndex === 0 || saving}
+              onClick={() => move(-1)}
+              type="button"
+            >
+              ← Previous
+            </button>
+            <label>
+              Slide
+              <select value={selectedIndex} onChange={(event) => selectSlide(Number(event.target.value))}>
+                {slides.map((slide, index) => (
+                  <option value={index} key={slide.id}>Page {slide.page_number} · {slide.image_id}</option>
+                ))}
+              </select>
+            </label>
+            <button
+              className="admin-action admin-action-primary"
+              disabled={selectedIndex === slides.length - 1 || saving}
+              onClick={() => move(1)}
+              type="button"
+            >
+              {saving ? "Saving..." : "Next →"}
+            </button>
           </div>
           <div className="annotation-submit">
             <span>
@@ -742,7 +883,7 @@ export default function AnnotationWorkspace() {
               onClick={submit}
               type="button"
             >
-              {task.status === "SUBMITTED" ? "Submitted" : "Submit Annotation"}
+              {task.status === "SUBMITTED" ? "Published" : "Publish Draft"}
             </button>
           </div>
         </>

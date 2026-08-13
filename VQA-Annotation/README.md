@@ -22,6 +22,17 @@ VQA dataset annotation platform with role-based authentication and document anno
 
 Backend configuration belongs in `backend/.env`. Copy `backend/.env.example` and set the required database, authentication, Google, Drive, and optional Gemini values. Never commit `.env` files or service credentials.
 
+### Google Drive setup
+
+1. Enable Google Drive API for the service account's Google Cloud project.
+2. Store the service-account JSON outside source control.
+3. Set `GOOGLE_DRIVE_SERVICE_ACCOUNT_FILE` in `backend/.env` to that JSON file's absolute path.
+4. Share source PDFs/folders with the service-account email as Viewer.
+5. Share destination folders with the service-account email as Editor.
+6. Restart the backend after changing `backend/.env`.
+
+The source PDF and destination folder are independent. Local PDF uploads also require a writable destination because generated page PNG files are uploaded to Drive immediately.
+
 Start the backend from `backend/`:
 
 ```powershell

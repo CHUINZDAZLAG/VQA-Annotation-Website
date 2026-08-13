@@ -3,10 +3,24 @@ import io
 import json
 import math
 from collections.abc import Iterable
-from datetime import datetime, timezone
 from typing import Any
 
 from app.models.annotation import AnnotationRecord
+
+
+EXPORT_COLUMNS = [
+    "task_id", "annotation_id", "output_type", "question_type", "image_id",
+    "generated_image_id", "slide_name", "categories", "category", "slide_type",
+    "language", "drive_link", "question", "question_text", "option_A", "option_B",
+    "option_C", "option_D", "answer", "main_annotator", "blind_annotator", "reviewer",
+    "main_label", "blind_label", "reviewer_label", "blind_question", "blind_answer",
+    "similarity_score", "reject_reason", "final_status", "main_annotator_decision",
+    "main_annotator_reject_reason", "main_annotator_reject_note",
+    "blind_annotator_decision", "blind_annotator_reject_reason",
+    "blind_annotator_reject_note", "reviewer_decision", "reviewer_reject_reason",
+    "reviewer_reject_note", "annotation_status", "created_by", "page_number",
+    "created_at", "updated_at", "option_a", "option_b", "option_c", "option_d",
+]
 
 
 def decision(record: AnnotationRecord, role: str) -> int | None:
@@ -99,23 +113,39 @@ def flatten_record(record: AnnotationRecord) -> dict[str, Any]:
     main = record.main_annotator or {}
     blind = record.blind_annotator or {}
     reviewer = record.reviewer or {}
+    main_decision = decision(record, "main_annotator")
+    blind_decision = decision(record, "blind_annotator")
+    reviewer_decision = decision(record, "reviewer")
+    options = {
+        letter: question.get(f"option_{letter.lower()}", question.get(f"option_{letter}"))
+        for letter in "ABCD"
+    }
     result = {
         "task_id": record.task_id,
         "annotation_id": record.id,
         "output_type": record.output_type,
+        "question_type": record.output_type,
         "image_id": record.image_id,
         "generated_image_id": record.generated_image_id,
         "slide_name": record.slide_name,
         "categories": record.categories,
+        "category": record.categories,
         "slide_type": record.slide_type,
         "language": record.language,
         "drive_link": getattr(record, "drive_link", None),
         "question": question,
         "question_text": question.get("question_text"),
+        "option_A": options["A"],
+        "option_B": options["B"],
+        "option_C": options["C"],
+        "option_D": options["D"],
         "answer": record.answer,
-        "main_label": getattr(record, "main_label", None) if getattr(record, "main_label", None) is not None else main.get("decision"),
-        "blind_label": getattr(record, "blind_label", None) if getattr(record, "blind_label", None) is not None else blind.get("decision"),
-        "reviewer_label": getattr(record, "reviewer_label", None) if getattr(record, "reviewer_label", None) is not None else reviewer.get("decision"),
+        "main_annotator": main_decision,
+        "blind_annotator": blind_decision,
+        "reviewer": reviewer_decision,
+        "main_label": main_decision,
+        "blind_label": blind_decision,
+        "reviewer_label": reviewer_decision,
         "blind_question": getattr(record, "blind_question", None),
         "blind_answer": getattr(record, "blind_answer", None),
         "similarity_score": getattr(record, "similarity_score", None),
@@ -136,8 +166,7 @@ def flatten_record(record: AnnotationRecord) -> dict[str, Any]:
         "created_at": record.created_at.isoformat() if record.created_at else None,
         "updated_at": record.updated_at.isoformat() if record.updated_at else None,
     }
-    if record.output_type == "MULTIPLE_CHOICE":
-        result.update({f"option_{letter}": question.get(f"option_{letter}", question.get(f"option_{letter.upper()}")) for letter in "abcd"})
+    result.update({f"option_{letter.lower()}": options[letter] for letter in "ABCD"})
     return result
 
 
@@ -156,8 +185,7 @@ def serialize_records(records: Iterable[AnnotationRecord], output_format: str) -
     normalized = output_format.upper()
     if normalized == "CSV":
         stream = io.StringIO(newline="")
-        fieldnames = list(rows[0].keys()) if rows else ["task_id", "annotation_id", "output_type"]
-        writer = csv.DictWriter(stream, fieldnames=fieldnames)
+        writer = csv.DictWriter(stream, fieldnames=EXPORT_COLUMNS)
         writer.writeheader()
         writer.writerows(rows)
         return stream.getvalue().encode("utf-8-sig"), "text/csv"
@@ -166,5 +194,4 @@ def serialize_records(records: Iterable[AnnotationRecord], output_format: str) -
 
 def filename(task_name: str, output_format: str) -> str:
     safe_name = "_".join(part for part in task_name.strip().split() if part) or "task"
-    date = datetime.now(timezone.utc).date().isoformat()
-    return f"{safe_name}_{date}.{output_format.lower()}"
+    return f"{safe_name}_final.{output_format.lower()}"

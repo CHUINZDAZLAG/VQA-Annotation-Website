@@ -53,6 +53,7 @@ class DocumentSlide(Base):
     document_id: Mapped[int] = mapped_column(ForeignKey("task_documents.id", ondelete="CASCADE"), nullable=False, index=True)
     page_number: Mapped[int] = mapped_column(Integer, nullable=False)
     image_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    drive_folder_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     drive_file_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
     drive_file_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     slide_name: Mapped[str] = mapped_column(String(255), nullable=False)
