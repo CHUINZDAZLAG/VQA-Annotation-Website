@@ -1,5 +1,6 @@
 import logging
 import re
+import shutil
 import tempfile
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -25,7 +26,7 @@ from app.schemas.document import BlindAnnotationInput, DecisionInput, DocumentRe
 from app.services import drive_service
 from app.services.gemini_service import generate_annotations
 from app.services.result_service import filename, final_dataset_records, serialize_records
-from app.services.storage_service import storage, supabase_storage
+from app.services.storage_service import supabase_storage
 
 router = APIRouter(prefix="/api/tasks", tags=["main-annotator-document"])
 logger = logging.getLogger(__name__)
@@ -131,6 +132,47 @@ def render_and_upload_pages(
     return uploaded_pages
 
 
+def backup_replaced_images(
+    database_session: Session,
+    existing: TaskDocument | None,
+    task_id: int,
+    slide_name: str,
+    backup_root: Path,
+) -> list[tuple[str, str, Path]]:
+    if existing is None:
+        return []
+    backups: list[tuple[str, str, Path]] = []
+    slides = database_session.scalars(
+        select(DocumentSlide).where(DocumentSlide.document_id == existing.id)
+    )
+    for slide in slides:
+        image_id = generated_image_id(slide_name, slide.page_number)
+        expected_path = supabase_storage.image_path(task_id, image_id)
+        if slide.storage_path != expected_path:
+            continue
+        backup_path = backup_root / f"{slide.id}.png"
+        backup_path.write_bytes(supabase_storage.download_image(expected_path))
+        backups.append((expected_path, image_id, backup_path))
+    return backups
+
+
+def recover_failed_reprocessing(
+    task_id: int,
+    uploaded_paths: list[str],
+    backups: list[tuple[str, str, Path]],
+) -> None:
+    backup_paths = {storage_path for storage_path, _, _ in backups}
+    new_paths = [storage_path for storage_path in uploaded_paths if storage_path not in backup_paths]
+    try:
+        supabase_storage.delete_images(new_paths)
+        for expected_path, image_id, backup_path in backups:
+            restored_path = supabase_storage.upload_image(task_id, image_id, backup_path.read_bytes())
+            if restored_path != expected_path:
+                raise RuntimeError(f"Restored image path mismatch: {expected_path}")
+    except Exception as error:
+        logger.error("Storage recovery failed for task %s: %s", task_id, error)
+
+
 def replace_stored_document(
     database_session: Session,
     task_id: int,
@@ -170,6 +212,8 @@ def replace_stored_document(
             slide = DocumentSlide(document_id=target_document.id, image_id=image_id)
             database_session.add(slide)
         else:
+            if slide.storage_path and slide.storage_path != uploaded["storage_path"]:
+                stale_storage_paths.append(slide.storage_path)
             current_image_ids.add(slide.image_id)
             slide.image_id = image_id
         slide.page_number = page_number
@@ -189,7 +233,7 @@ def replace_stored_document(
             if slide.storage_path:
                 stale_storage_paths.append(slide.storage_path)
             database_session.delete(slide)
-    return stale_storage_paths
+    return list(dict.fromkeys(stale_storage_paths))
 
 
 def require_reprocessable_document(database_session: Session, existing: TaskDocument | None) -> None:
@@ -294,6 +338,10 @@ async def upload_document(
     if not filename.lower().endswith(".pdf") or document.content_type not in {"application/pdf", "application/octet-stream", None}:
         raise HTTPException(status_code=415, detail="Only PDF files are accepted.")
     temp_path: Path | None = None
+    backup_root = Path(tempfile.mkdtemp(prefix="vqa-storage-backup-"))
+    backups: list[tuple[str, str, Path]] = []
+    uploaded_paths: list[str] = []
+    committed = False
     try:
         require_reprocessable_document(database_session, existing)
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as handle:
@@ -313,7 +361,9 @@ async def upload_document(
                         detail=f"The PDF exceeds the {settings.max_pdf_size_mb} MB size limit.",
                     )
                 handle.write(chunk)
+        backups = backup_replaced_images(database_session, existing, task_id, normalized_name, backup_root)
         pages = render_and_upload_pages(temp_path, normalized_name, task_id)
+        uploaded_paths = [page[2]["storage_path"] for page in pages]
         stored_document = TaskDocument(
             task_id=task_id,
             original_filename=filename,
@@ -324,25 +374,35 @@ async def upload_document(
             page_count=len(pages),
         )
         stale_storage_paths = replace_stored_document(database_session, task_id, existing, stored_document, pages)
+        persisted_document = existing or stored_document
         task.status = TaskStatus.IN_PROGRESS
         database_session.commit()
-        supabase_storage.delete_images(stale_storage_paths)
-        database_session.refresh(stored_document)
+        committed = True
+        try:
+            supabase_storage.delete_images(stale_storage_paths)
+        except Exception as error:
+            logger.warning("Stale image cleanup failed for task %s: %s", task_id, error)
+        database_session.refresh(persisted_document)
         return {
-            "document": DocumentResponse.model_validate(stored_document),
+            "document": DocumentResponse.model_validate(persisted_document),
             "slides": get_slides(task_id, current_user, database_session),
         }
     except HTTPException:
         database_session.rollback()
+        if not committed:
+            recover_failed_reprocessing(task_id, uploaded_paths, backups)
         raise
     except Exception as error:
         database_session.rollback()
+        if not committed:
+            recover_failed_reprocessing(task_id, uploaded_paths, backups)
         error_detail = drive_error_detail(error)
         logger.warning("PDF processing failed for task %s: %s", task_id, error_detail)
         raise HTTPException(status_code=422, detail=f"PDF processing failed: {error_detail}") from error
     finally:
         if temp_path:
             temp_path.unlink(missing_ok=True)
+        shutil.rmtree(backup_root, ignore_errors=True)
 
 
 @router.get("/{task_id}/document/drive-files", response_model=list[dict])
@@ -363,13 +423,19 @@ def select_drive_document(task_id: int, payload: DriveDocumentSelection, current
     if not SLIDE_NAME_PATTERN.fullmatch(normalized_name) or ".." in normalized_name:
         raise HTTPException(status_code=422, detail="slide_name contains invalid characters.")
     temp_path: Path | None = None
+    backup_root = Path(tempfile.mkdtemp(prefix="vqa-storage-backup-"))
+    backups: list[tuple[str, str, Path]] = []
+    uploaded_paths: list[str] = []
+    committed = False
     try:
         old_document = database_session.scalar(select(TaskDocument).where(TaskDocument.task_id == task_id))
         require_reprocessable_document(database_session, old_document)
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as handle:
             temp_path = Path(handle.name)
         metadata = drive_service.download_pdf(payload.pdf_file_id, temp_path, user_id=current_user.id)
+        backups = backup_replaced_images(database_session, old_document, task_id, normalized_name, backup_root)
         pages = render_and_upload_pages(temp_path, normalized_name, task_id)
+        uploaded_paths = [page[2]["storage_path"] for page in pages]
         stored_document = TaskDocument(
             task_id=task_id, original_filename=metadata["name"], slide_name=normalized_name,
             drive_folder_id=None, source_pdf_file_id=metadata["id"], source_pdf_url=metadata.get("webViewLink"),
@@ -377,23 +443,33 @@ def select_drive_document(task_id: int, payload: DriveDocumentSelection, current
             page_count=len(pages),
         )
         stale_storage_paths = replace_stored_document(database_session, task_id, old_document, stored_document, pages)
+        persisted_document = old_document or stored_document
         task.status = TaskStatus.IN_PROGRESS
         database_session.commit()
-        supabase_storage.delete_images(stale_storage_paths)
-        database_session.refresh(stored_document)
+        committed = True
+        try:
+            supabase_storage.delete_images(stale_storage_paths)
+        except Exception as error:
+            logger.warning("Stale image cleanup failed for task %s: %s", task_id, error)
+        database_session.refresh(persisted_document)
         return {
-            "document": DocumentResponse.model_validate(stored_document),
+            "document": DocumentResponse.model_validate(persisted_document),
             "slides": get_slides(task_id, current_user, database_session),
         }
     except HTTPException:
         database_session.rollback()
+        if not committed:
+            recover_failed_reprocessing(task_id, uploaded_paths, backups)
         raise
     except Exception as error:
         database_session.rollback()
+        if not committed:
+            recover_failed_reprocessing(task_id, uploaded_paths, backups)
         raise HTTPException(status_code=422, detail=f"Google Drive PDF processing failed: {drive_error_detail(error)}") from error
     finally:
         if temp_path:
             temp_path.unlink(missing_ok=True)
+        shutil.rmtree(backup_root, ignore_errors=True)
 
 
 @router.patch("/{task_id}/document/drive-link", response_model=dict)
@@ -511,9 +587,7 @@ def read_image_bytes(slide: DocumentSlide, task_id: int, user_id: int | None = N
             return drive_service.download_file_bytes(slide.drive_file_id, user_id=user_id)
         except (ValueError, RuntimeError) as error:
             raise HTTPException(status_code=404, detail="Drive slide image is unavailable.") from error
-    if not image_path.is_relative_to(storage.task_root(task_id).resolve()) or not image_path.is_file():
-        raise HTTPException(status_code=404, detail="Slide image is not available.")
-    return image_path.read_bytes(), "image/png"
+    raise HTTPException(status_code=404, detail="Slide image is not available.")
 
 
 def image_response(slide: DocumentSlide, task_id: int, user_id: int | None = None) -> Response:

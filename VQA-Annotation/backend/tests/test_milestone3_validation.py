@@ -13,12 +13,14 @@ import pymupdf
 from fastapi import HTTPException
 from oauthlib.oauth2 import OAuth2Error
 from pydantic import ValidationError
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import Session
 
 from app.models.annotation import AnnotationRecord
-from app.models.document import DocumentSlide, TaskDocument
+from app.models.document import DocumentSlide, SlideStatus, TaskDocument
 from app.models.task import OutputType, TaskStatus
 from app.routers.auth import google_drive_callback
-from app.routers.document import PAGE_RENDER_DPI, SLIDE_NAME_PATTERN, delete_draft_annotation, generated_image_id, render_and_upload_pages, save_annotation, upload_document, validate_question
+from app.routers.document import PAGE_RENDER_DPI, SLIDE_NAME_PATTERN, backup_replaced_images, delete_draft_annotation, generated_image_id, get_slides, recover_failed_reprocessing, render_and_upload_pages, replace_stored_document, save_annotation, upload_document, validate_question
 from app.routers.results import google_drive_health
 from app.schemas.document import DriveDocumentSelection, DriveLinkInput, SlideAnnotationBatchInput, SlideAnnotationInput
 from app.services.result_service import DatasetItem, build_dataset_package, document_split, filename, final_dataset_records, flatten_record, fleiss_agreement_stats, serialize_records
@@ -40,6 +42,8 @@ class Milestone3ValidationTests(unittest.TestCase):
     @patch("app.services.storage_service.requests.get")
     def test_supabase_storage_readiness_checks_private_bucket(self, requests_get):
         response = MagicMock(status_code=200)
+        response.ok = True
+        response.json.return_value = {"id": "slide-images", "public": False}
         requests_get.return_value = response
         storage_service = SupabaseImageStorage()
         storage_service.base_url = "https://project.supabase.co"
@@ -52,6 +56,19 @@ class Milestone3ValidationTests(unittest.TestCase):
         )
         self.assertEqual(requests_get.call_args.kwargs["headers"]["apikey"], "sb_secret_backend")
         self.assertNotIn("Authorization", requests_get.call_args.kwargs["headers"])
+
+    @patch("app.services.storage_service.requests.get")
+    def test_supabase_storage_readiness_rejects_public_bucket(self, requests_get):
+        response = MagicMock(status_code=200, ok=True)
+        response.json.return_value = {"id": "slide-images", "public": True}
+        requests_get.return_value = response
+        storage_service = SupabaseImageStorage()
+        storage_service.base_url = "https://project.supabase.co"
+        storage_service.service_role_key = "sb_secret_backend"
+        storage_service.bucket = "slide-images"
+
+        with self.assertRaisesRegex(RuntimeError, "must be private"):
+            storage_service.check_bucket()
 
     def test_supabase_storage_rejects_publishable_key(self):
         storage_service = SupabaseImageStorage()
@@ -305,6 +322,220 @@ class Milestone3ValidationTests(unittest.TestCase):
             "42/deck_Page01.png", "42/deck_Page02.png",
         ])
 
+    @patch("app.routers.document.supabase_storage.upload_image")
+    def test_twenty_page_pdf_uploads_twenty_unique_images(self, upload_image):
+        upload_image.side_effect = [
+            f"12/cake_Page{page_number:02d}.png"
+            for page_number in range(1, 21)
+        ]
+        with TemporaryDirectory() as directory:
+            pdf_path = Path(directory) / "twenty-pages.pdf"
+            pdf = pymupdf.open()
+            for _ in range(20):
+                pdf.new_page()
+            pdf.save(pdf_path)
+            pdf.close()
+
+            pages = render_and_upload_pages(pdf_path, "cake", 12)
+
+        image_ids = [page[1] for page in pages]
+        storage_paths = [page[2]["storage_path"] for page in pages]
+        self.assertEqual(len(pages), 20)
+        self.assertEqual(image_ids, [f"cake_Page{page_number:02d}" for page_number in range(1, 21)])
+        self.assertEqual(storage_paths, [f"12/cake_Page{page_number:02d}.png" for page_number in range(1, 21)])
+        self.assertEqual(upload_image.call_count, 20)
+
+    def test_twenty_pages_create_twenty_document_slide_records(self):
+        database_session = MagicMock()
+        stored_document = TaskDocument(
+            id=8,
+            task_id=12,
+            original_filename="cake.pdf",
+            slide_name="cake",
+            storage_reference="upload:cake.pdf",
+            page_count=20,
+        )
+        pages = [
+            (
+                page_number,
+                f"cake_Page{page_number:02d}",
+                {
+                    "storage_path": f"12/cake_Page{page_number:02d}.png",
+                    "width": 1240,
+                    "height": 1754,
+                    "file_size": 1000 + page_number,
+                    "mime_type": "image/png",
+                },
+            )
+            for page_number in range(1, 21)
+        ]
+
+        stale_paths = replace_stored_document(database_session, 12, None, stored_document, pages)
+
+        slides = [
+            call.args[0]
+            for call in database_session.add.call_args_list
+            if isinstance(call.args[0], DocumentSlide)
+        ]
+        self.assertEqual(stale_paths, [])
+        self.assertEqual(len(slides), 20)
+        self.assertEqual([slide.page_number for slide in slides], list(range(1, 21)))
+        self.assertEqual([slide.image_id for slide in slides], [
+            f"cake_Page{page_number:02d}" for page_number in range(1, 21)
+        ])
+        self.assertEqual([slide.storage_path for slide in slides], [
+            f"12/cake_Page{page_number:02d}.png" for page_number in range(1, 21)
+        ])
+
+    def test_twenty_document_slides_commit_and_query_through_sqlalchemy(self):
+        engine = create_engine("sqlite:///:memory:")
+        TaskDocument.__table__.create(engine)
+        DocumentSlide.__table__.create(engine)
+        pages = [
+            (
+                page_number,
+                f"cake_Page{page_number:02d}",
+                {
+                    "storage_path": f"12/cake_Page{page_number:02d}.png",
+                    "width": 1240,
+                    "height": 1754,
+                    "file_size": 1000 + page_number,
+                    "mime_type": "image/png",
+                },
+            )
+            for page_number in range(1, 21)
+        ]
+        document = TaskDocument(
+            task_id=12,
+            original_filename="cake.pdf",
+            slide_name="cake",
+            storage_reference="upload:cake.pdf",
+            page_count=20,
+        )
+
+        with Session(engine) as database_session:
+            replace_stored_document(database_session, 12, None, document, pages)
+            database_session.commit()
+            persisted = list(database_session.scalars(
+                select(DocumentSlide).order_by(DocumentSlide.page_number)
+            ))
+
+        self.assertEqual(len(persisted), 20)
+        self.assertEqual([slide.image_id for slide in persisted], [
+            f"cake_Page{page_number:02d}" for page_number in range(1, 21)
+        ])
+        self.assertEqual([slide.storage_path for slide in persisted], [
+            f"12/cake_Page{page_number:02d}.png" for page_number in range(1, 21)
+        ])
+
+    def test_slides_api_serializes_all_twenty_pages_in_order(self):
+        database_session = MagicMock()
+        database_session.scalar.return_value = SimpleNamespace(id=8, task_id=12)
+        slides = [
+            DocumentSlide(
+                id=page_number,
+                document_id=8,
+                page_number=page_number,
+                image_id=f"cake_Page{page_number:02d}",
+                slide_name="cake",
+                image_reference=f"supabase:12/cake_Page{page_number:02d}.png",
+                storage_path=f"12/cake_Page{page_number:02d}.png",
+                status=SlideStatus.NOT_STARTED,
+            )
+            for page_number in range(1, 21)
+        ]
+        database_session.scalars.side_effect = [slides, []]
+
+        response = get_slides(12, SimpleNamespace(id=23), database_session)
+
+        self.assertEqual(len(response), 20)
+        self.assertEqual([slide.page_number for slide in response], list(range(1, 21)))
+        self.assertEqual([slide.image_id for slide in response], [
+            f"cake_Page{page_number:02d}" for page_number in range(1, 21)
+        ])
+        self.assertEqual(response[-1].image_url, "/api/tasks/12/images/cake_Page20")
+
+    @patch("app.routers.document.supabase_storage.upload_image")
+    @patch("app.routers.document.supabase_storage.delete_images")
+    def test_failed_reprocessing_restores_old_images_and_removes_new_paths(self, delete_images, upload_image):
+        upload_image.return_value = "12/cake_Page01.png"
+        with TemporaryDirectory() as directory:
+            backup_path = Path(directory) / "1.png"
+            backup_path.write_bytes(b"old-page-one")
+
+            recover_failed_reprocessing(
+                12,
+                ["12/cake_Page01.png", "12/cake_Page02.png"],
+                [("12/cake_Page01.png", "cake_Page01", backup_path)],
+            )
+
+        delete_images.assert_called_once_with(["12/cake_Page02.png"])
+        upload_image.assert_called_once_with(12, "cake_Page01", b"old-page-one")
+
+    @patch("app.routers.document.supabase_storage.download_image", return_value=b"old-page-one")
+    def test_reprocessing_backs_up_paths_that_will_be_upserted(self, download_image):
+        database_session = MagicMock()
+        existing = SimpleNamespace(id=8)
+        database_session.scalars.return_value = [SimpleNamespace(
+            id=1,
+            page_number=1,
+            storage_path="12/cake_Page01.png",
+        )]
+        with TemporaryDirectory() as directory:
+            backups = backup_replaced_images(
+                database_session,
+                existing,
+                12,
+                "cake",
+                Path(directory),
+            )
+
+            self.assertEqual(len(backups), 1)
+            self.assertEqual(backups[0][:2], ("12/cake_Page01.png", "cake_Page01"))
+            self.assertEqual(backups[0][2].read_bytes(), b"old-page-one")
+        download_image.assert_called_once_with("12/cake_Page01.png")
+
+    def test_renamed_reprocessing_marks_old_storage_paths_stale(self):
+        database_session = MagicMock()
+        existing = TaskDocument(
+            id=8,
+            task_id=12,
+            original_filename="old.pdf",
+            slide_name="old",
+            storage_reference="upload:old.pdf",
+            page_count=1,
+        )
+        old_slide = DocumentSlide(
+            id=1,
+            document_id=8,
+            page_number=1,
+            image_id="old_Page01",
+            slide_name="old",
+            image_reference="supabase:12/old_Page01.png",
+            storage_path="12/old_Page01.png",
+        )
+        database_session.scalars.return_value = [old_slide]
+        replacement = TaskDocument(
+            task_id=12,
+            original_filename="new.pdf",
+            slide_name="new",
+            storage_reference="upload:new.pdf",
+            page_count=1,
+        )
+        pages = [(1, "new_Page01", {
+            "storage_path": "12/new_Page01.png",
+            "width": 1240,
+            "height": 1754,
+            "file_size": 1001,
+            "mime_type": "image/png",
+        })]
+
+        stale_paths = replace_stored_document(database_session, 12, existing, replacement, pages)
+
+        self.assertEqual(stale_paths, ["12/old_Page01.png"])
+        self.assertEqual(old_slide.image_id, "new_Page01")
+        self.assertEqual(old_slide.storage_path, "12/new_Page01.png")
+
     @patch("app.routers.document.supabase_storage.delete_images")
     @patch("app.routers.document.supabase_storage.upload_image")
     def test_pdf_pipeline_cleans_only_new_files_after_partial_failure(self, upload_image, delete_images):
@@ -367,6 +598,117 @@ class Milestone3ValidationTests(unittest.TestCase):
 
         self.assertEqual(result["slides"], [{"image_id": "deck_Page01"}])
         get_slides.assert_called_once_with(12, current_user, database_session)
+
+    @patch("app.routers.document.DocumentResponse.model_validate", return_value={"id": 7})
+    @patch("app.routers.document.get_slides", return_value=[{"image_id": "deck_Page01"}])
+    @patch("app.routers.document.replace_stored_document", return_value=[])
+    @patch("app.routers.document.render_and_upload_pages", return_value=[
+        (1, "deck_Page01", {"storage_path": "12/deck_Page01.png"}),
+    ])
+    @patch("app.routers.document.backup_replaced_images", return_value=[])
+    @patch("app.routers.document.require_reprocessable_document")
+    @patch("app.routers.document.require_document_task")
+    def test_reprocessing_refreshes_existing_document(
+        self,
+        require_document_task,
+        _require_reprocessable_document,
+        _backup_replaced_images,
+        _render_and_upload_pages,
+        _replace_stored_document,
+        _get_slides,
+        _model_validate,
+    ):
+        require_document_task.return_value = SimpleNamespace(status=TaskStatus.IN_PROGRESS)
+        existing = TaskDocument(
+            id=7,
+            task_id=12,
+            original_filename="old.pdf",
+            slide_name="deck",
+            storage_reference="upload:old.pdf",
+            page_count=1,
+        )
+        database_session = MagicMock()
+        database_session.scalar.return_value = existing
+
+        class UploadedPdf:
+            filename = "new.pdf"
+            content_type = "application/pdf"
+
+            def __init__(self):
+                self.chunks = [b"%PDF-1.7\n", b""]
+
+            async def read(self, _size):
+                return self.chunks.pop(0)
+
+        asyncio.run(upload_document(
+            task_id=12,
+            current_user=SimpleNamespace(id=23),
+            database_session=database_session,
+            document=UploadedPdf(),
+            slide_name="deck",
+            destination_drive_folder_id=None,
+        ))
+
+        database_session.refresh.assert_called_once_with(existing)
+
+    @patch("app.routers.document.recover_failed_reprocessing")
+    @patch("app.routers.document.replace_stored_document", return_value=[])
+    @patch("app.routers.document.render_and_upload_pages", return_value=[
+        (1, "deck_Page01", {"storage_path": "12/deck_Page01.png"}),
+    ])
+    @patch("app.routers.document.backup_replaced_images", return_value=[
+        ("12/deck_Page01.png", "deck_Page01", Path("backup.png")),
+    ])
+    @patch("app.routers.document.require_reprocessable_document")
+    @patch("app.routers.document.require_document_task")
+    def test_database_failure_triggers_storage_recovery(
+        self,
+        require_document_task,
+        _require_reprocessable_document,
+        backup_replaced_images,
+        _render_and_upload_pages,
+        _replace_stored_document,
+        recover_failed_reprocessing,
+    ):
+        require_document_task.return_value = SimpleNamespace(status=TaskStatus.IN_PROGRESS)
+        existing = TaskDocument(
+            id=7,
+            task_id=12,
+            original_filename="old.pdf",
+            slide_name="deck",
+            storage_reference="upload:old.pdf",
+            page_count=1,
+        )
+        database_session = MagicMock()
+        database_session.scalar.return_value = existing
+        database_session.commit.side_effect = RuntimeError("database unavailable")
+
+        class UploadedPdf:
+            filename = "new.pdf"
+            content_type = "application/pdf"
+
+            def __init__(self):
+                self.chunks = [b"%PDF-1.7\n", b""]
+
+            async def read(self, _size):
+                return self.chunks.pop(0)
+
+        with self.assertRaises(HTTPException) as raised:
+            asyncio.run(upload_document(
+                task_id=12,
+                current_user=SimpleNamespace(id=23),
+                database_session=database_session,
+                document=UploadedPdf(),
+                slide_name="deck",
+                destination_drive_folder_id=None,
+            ))
+
+        self.assertEqual(raised.exception.status_code, 422)
+        recover_failed_reprocessing.assert_called_once_with(
+            12,
+            ["12/deck_Page01.png"],
+            backup_replaced_images.return_value,
+        )
 
     def test_slide_name_rejects_paths_and_invalid_characters(self):
         self.assertIsNotNone(SLIDE_NAME_PATTERN.fullmatch("Training01"))

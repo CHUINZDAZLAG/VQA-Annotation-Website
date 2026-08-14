@@ -42,7 +42,7 @@ Drive operations use the authenticated user's stored connection.
 Source PDFs/folders must be readable and destination Task folders writable by the Google account
 that the current user connected.
 
-The source PDF and destination folder are independent. Local PDF uploads also require a writable destination because generated page PNG files are uploaded to Drive immediately.
+The source PDF and optional export destination are independent. Local PDF uploads do not require Google Drive; generated page PNG files are uploaded directly to private Supabase Storage.
 
 Start the backend from `backend/`:
 
@@ -62,7 +62,7 @@ npm run dev
 
 Create the service from `render.yaml`, or configure a Python Web Service with root directory `backend`, build command `pip install -r requirements.txt`, start command `uvicorn app.main:app --host 0.0.0.0 --port $PORT`, and health path `/health`. The Blueprint explicitly selects Render's free plan in Singapore; upgrade the instance in Render if 300 DPI processing exceeds the free instance's memory or request limits.
 
-Set all `sync: false` values from `render.yaml` in Render. Use the Supabase PostgreSQL connection URI for `DATABASE_URL`. Set `FRONTEND_URL` to the exact Vercel production origin, without a trailing slash. Multiple explicit origins may be comma-separated. Render disk is used only for temporary PDF processing; generated PNGs and exports are uploaded directly to Drive.
+Set all `sync: false` values from `render.yaml` in Render. Use the Supabase PostgreSQL connection URI for `DATABASE_URL`. Set `FRONTEND_URL` to the exact Vercel production origin, without a trailing slash. Multiple explicit origins may be comma-separated. Render disk is used only for temporary PDF processing and reprocessing recovery. Generated PNGs are stored in the private Supabase Storage `slide-images` bucket. Google Drive is only a PDF input source and an optional destination for completed dataset exports.
 
 ### Vercel frontend
 

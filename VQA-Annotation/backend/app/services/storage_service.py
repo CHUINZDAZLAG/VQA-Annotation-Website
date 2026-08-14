@@ -131,6 +131,12 @@ class SupabaseImageStorage:
             timeout=15,
         )
         self._raise_storage_error(response, "bucket check")
+        try:
+            bucket = response.json()
+        except ValueError as error:
+            raise RuntimeError("Supabase Storage bucket check returned invalid JSON.") from error
+        if bucket.get("public") is not False:
+            raise RuntimeError(f"Supabase Storage bucket {self.bucket} must be private.")
 
     def download_image(self, storage_path: str) -> bytes:
         response = requests.get(
