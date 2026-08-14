@@ -28,6 +28,7 @@ class Settings(BaseSettings):
     supabase_url: str = ""
     supabase_service_role_key: str = ""
     supabase_storage_bucket: str = "slide-images"
+    # Zero disables the optional file-size guard; PDF page count is not capped by the application.
     max_pdf_size_mb: int = 0
 
     model_config = SettingsConfigDict(
