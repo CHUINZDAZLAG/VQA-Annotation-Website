@@ -14,19 +14,60 @@ const portalKeys = {
   admin: { access: 'vqa_admin_access_token', refresh: 'vqa_admin_refresh_token' },
 };
 
-async function request(path, options = {}, portal = 'user') {
+function clearSession(portal) {
+  const keys = portalKeys[portal];
+  localStorage.removeItem(keys.access);
+  localStorage.removeItem(keys.refresh);
+}
+
+async function refreshSession(portal) {
+  const keys = portalKeys[portal];
+  const refreshToken = localStorage.getItem(keys.refresh);
+  if (!refreshToken) return false;
+  const path = portal === 'admin' ? '/api/admin/auth/refresh' : '/api/auth/refresh';
+  let response;
+  try {
+    response = await fetch(apiUrl(path), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refresh_token: refreshToken }),
+    });
+  } catch {
+    throw new Error('Cannot reach the backend. Wait for Render to finish starting, then try again.');
+  }
+  if (!response.ok) {
+    clearSession(portal);
+    return false;
+  }
+  const authentication = await response.json();
+  localStorage.setItem(keys.access, authentication.access_token);
+  localStorage.setItem(keys.refresh, authentication.refresh_token);
+  return true;
+}
+
+async function request(path, options = {}, portal = 'user', retryAuthentication = true) {
   const keys = portalKeys[portal];
   const accessToken = localStorage.getItem(keys.access);
   const headers = new Headers(options.headers);
   if (accessToken) headers.set('Authorization', `Bearer ${accessToken}`);
 
-  const response = await fetch(apiUrl(path), {
-    ...options,
-    headers,
-  });
+  let response;
+  try {
+    response = await fetch(apiUrl(path), {
+      ...options,
+      headers,
+    });
+  } catch {
+    throw new Error('Cannot reach the backend. Wait for Render to finish starting, then try again.');
+  }
+
+  if (response.status === 401 && retryAuthentication && await refreshSession(portal)) {
+    return request(path, options, portal, false);
+  }
 
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
+    if (response.status === 401) clearSession(portal);
     throw new Error(body.detail ?? 'Request failed.');
   }
 
@@ -34,6 +75,7 @@ async function request(path, options = {}, portal = 'user') {
 }
 
 export const authService = {
+  hasSession: (portal = 'user') => Boolean(localStorage.getItem(portalKeys[portal].refresh)),
   async loginWithGoogle(idToken) {
     const authentication = await request('/api/auth/google', {
       method: 'POST',
@@ -55,16 +97,8 @@ export const authService = {
     return authentication.user;
   },
   async refresh(portal = 'user') {
-    const refreshToken = localStorage.getItem(portalKeys[portal].refresh);
-    if (!refreshToken) throw new Error('No refresh token is available.');
-    const authentication = await request(portal === 'admin' ? '/api/admin/auth/refresh' : '/api/auth/refresh', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ refresh_token: refreshToken }),
-    });
-    localStorage.setItem(portalKeys[portal].access, authentication.access_token);
-    localStorage.setItem(portalKeys[portal].refresh, authentication.refresh_token);
-    return authentication.user;
+    if (!await refreshSession(portal)) throw new Error('No valid refresh token is available.');
+    return portal === 'admin' ? authService.getCurrentAdmin() : authService.getCurrentUser();
   },
   getCurrentUser: () => request('/api/auth/me', {}, 'user'),
   getGoogleDriveConnection: (portal = 'user') => request('/api/auth/google/drive/status', {}, portal),
@@ -79,8 +113,7 @@ export const authService = {
     try {
       await request(portal === 'admin' ? '/api/admin/auth/logout' : '/api/auth/logout', { method: 'POST' }, portal);
     } finally {
-      localStorage.removeItem(portalKeys[portal].access);
-      localStorage.removeItem(portalKeys[portal].refresh);
+      clearSession(portal);
     }
   },
   listAdminTasks: () => request('/api/admin/tasks', {}, 'admin'),

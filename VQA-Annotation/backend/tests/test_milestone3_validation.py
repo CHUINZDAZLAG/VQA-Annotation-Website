@@ -1,3 +1,4 @@
+import base64
 import json
 import io
 import unittest
@@ -41,15 +42,33 @@ class Milestone3ValidationTests(unittest.TestCase):
         requests_get.return_value = response
         storage_service = SupabaseImageStorage()
         storage_service.base_url = "https://project.supabase.co"
-        storage_service.service_role_key = "service-role"
+        storage_service.service_role_key = "sb_secret_backend"
         storage_service.bucket = "slide-images"
         storage_service.check_bucket()
-        response.raise_for_status.assert_called_once_with()
         self.assertEqual(
             requests_get.call_args.args[0],
             "https://project.supabase.co/storage/v1/bucket/slide-images",
         )
-        self.assertEqual(requests_get.call_args.kwargs["headers"]["Authorization"], "Bearer service-role")
+        self.assertEqual(requests_get.call_args.kwargs["headers"]["apikey"], "sb_secret_backend")
+        self.assertNotIn("Authorization", requests_get.call_args.kwargs["headers"])
+
+    def test_supabase_storage_rejects_publishable_key(self):
+        storage_service = SupabaseImageStorage()
+        storage_service.base_url = "https://project.supabase.co"
+        storage_service.service_role_key = "sb_publishable_browser"
+        storage_service.bucket = "slide-images"
+        with self.assertRaisesRegex(RuntimeError, "contains a publishable key"):
+            storage_service.require_configuration()
+
+    def test_supabase_storage_uses_bearer_only_for_service_role_jwt(self):
+        payload = base64.urlsafe_b64encode(json.dumps({"role": "service_role"}).encode()).decode().rstrip("=")
+        storage_service = SupabaseImageStorage()
+        storage_service.base_url = "https://project.supabase.co"
+        storage_service.service_role_key = f"eyJ.{payload}.signature"
+        storage_service.bucket = "slide-images"
+        storage_service.require_configuration()
+        headers = storage_service._headers()
+        self.assertEqual(headers["Authorization"], f"Bearer {storage_service.service_role_key}")
 
     def test_dataset_package_deduplicates_images_and_keeps_document_split(self):
         document = TaskDocument(

@@ -17,6 +17,13 @@ export default function Login() {
   useEffect(() => {
     let isCurrent = true;
 
+    if (!authService.hasSession()) {
+      setCheckingSession(false);
+      return () => {
+        isCurrent = false;
+      };
+    }
+
     authService.getCurrentUser()
       .then((user) => {
         if (isCurrent) navigate(roleRoutes[user.system_role] ?? '/login', { replace: true });

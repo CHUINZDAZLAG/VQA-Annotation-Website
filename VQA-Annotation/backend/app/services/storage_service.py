@@ -1,3 +1,5 @@
+import base64
+import json
 from pathlib import Path
 from urllib.parse import quote
 
@@ -63,6 +65,22 @@ class SupabaseImageStorage:
         ]
         if missing:
             raise RuntimeError(f"Supabase Storage is not configured: {', '.join(missing)}")
+        if self.service_role_key.startswith("sb_publishable_"):
+            raise RuntimeError(
+                "SUPABASE_SERVICE_ROLE_KEY contains a publishable key. Configure a backend secret or service_role key."
+            )
+        if self.service_role_key.startswith("eyJ") and self._jwt_role() != "service_role":
+            raise RuntimeError(
+                "SUPABASE_SERVICE_ROLE_KEY contains an anon JWT. Configure the service_role JWT instead."
+            )
+
+    def _jwt_role(self) -> str | None:
+        try:
+            payload = self.service_role_key.split(".")[1]
+            payload += "=" * (-len(payload) % 4)
+            return json.loads(base64.urlsafe_b64decode(payload).decode("utf-8")).get("role")
+        except (IndexError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+            return None
 
     def image_path(self, task_id: int, image_id: str) -> str:
         return f"{task_id}/{image_id}.png"
@@ -75,13 +93,24 @@ class SupabaseImageStorage:
         )
 
     def _headers(self, content_type: str | None = None) -> dict[str, str]:
-        headers = {
-            "Authorization": f"Bearer {self.service_role_key}",
-            "apikey": self.service_role_key,
-        }
+        headers = {"apikey": self.service_role_key}
+        if self.service_role_key.startswith("eyJ"):
+            headers["Authorization"] = f"Bearer {self.service_role_key}"
         if content_type:
             headers["Content-Type"] = content_type
         return headers
+
+    @staticmethod
+    def _raise_storage_error(response: requests.Response, operation: str) -> None:
+        if response.ok:
+            return
+        try:
+            payload = response.json()
+            detail = payload.get("message") or payload.get("error") or payload.get("statusCode")
+        except (ValueError, AttributeError):
+            detail = response.text
+        detail = str(detail or "Unknown Storage API error").strip()[:500]
+        raise RuntimeError(f"Supabase Storage {operation} failed ({response.status_code}): {detail}")
 
     def upload_image(self, task_id: int, image_id: str, content: bytes) -> str:
         storage_path = self.image_path(task_id, image_id)
@@ -91,9 +120,7 @@ class SupabaseImageStorage:
             data=content,
             timeout=60,
         )
-        if response.status_code == 404:
-            raise RuntimeError(f"Supabase Storage bucket '{self.bucket}' does not exist.")
-        response.raise_for_status()
+        self._raise_storage_error(response, "upload")
         return storage_path
 
     def check_bucket(self) -> None:
@@ -103,9 +130,7 @@ class SupabaseImageStorage:
             headers=self._headers(),
             timeout=15,
         )
-        if response.status_code == 404:
-            raise RuntimeError("Supabase Storage bucket is unavailable.")
-        response.raise_for_status()
+        self._raise_storage_error(response, "bucket check")
 
     def download_image(self, storage_path: str) -> bytes:
         response = requests.get(
@@ -115,7 +140,7 @@ class SupabaseImageStorage:
         )
         if response.status_code == 404:
             raise FileNotFoundError(storage_path)
-        response.raise_for_status()
+        self._raise_storage_error(response, "download")
         if not response.content.startswith(b"\x89PNG\r\n\x1a\n"):
             raise RuntimeError(f"Stored slide image is not a valid PNG: {storage_path}")
         return response.content
@@ -130,7 +155,7 @@ class SupabaseImageStorage:
             json={"prefixes": storage_paths},
             timeout=30,
         )
-        response.raise_for_status()
+        self._raise_storage_error(response, "delete")
 
 
 supabase_storage = SupabaseImageStorage()
