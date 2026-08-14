@@ -11,6 +11,9 @@ venv/
 .env
 backend/.env
 backend/storage/
+backend/credentials/
+*service-account*.json
+*service_account*.json
 
 # Node / Vite
 node_modules/

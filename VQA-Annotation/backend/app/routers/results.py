@@ -249,6 +249,33 @@ def set_drive_folder(task_id: int, payload: DriveFolderUpdate, _: AdminUser,
     }
 
 
+@router.get("/admin/tasks/{task_id}/google-drive/health", response_model=dict)
+def google_drive_health(task_id: int, _: AdminUser, database_session: Session = Depends(get_db)) -> dict:
+    task = _task_or_404(database_session, task_id)
+    folder_id = task.drive_folder_id or task.annotator_drive_folder_id or task.admin_drive_folder_id
+    if not folder_id:
+        raise HTTPException(status_code=422, detail="This task does not have a Google Drive folder configured.")
+    try:
+        from app.services import drive_service
+        verified_folder_id = drive_service.verify_writable_folder(folder_id)
+        authentication = drive_service.authentication_info()
+    except Exception as error:
+        status_code = getattr(getattr(error, "resp", None), "status", None)
+        detail = (
+            "Google Drive authentication or folder permission failed. Share the task folder with the "
+            "configured backend account with Editor access."
+            if status_code in {401, 403} or isinstance(error, PermissionError)
+            else str(error)
+        )
+        raise HTTPException(status_code=503, detail=detail) from error
+    return {
+        "status": "ok",
+        "folder_id": verified_folder_id,
+        "authentication_method": authentication["method"],
+        "account_email": authentication["account_email"],
+    }
+
+
 @router.get("/admin/tasks/{task_id}/exports", response_model=list[TaskExportResponse])
 def list_exports(task_id: int, _: AdminUser, database_session: Session = Depends(get_db)) -> list[TaskExport]:
     _task_or_404(database_session, task_id)
@@ -275,7 +302,14 @@ def export_task(task_id: int, payload: ExportRequest, _: AdminUser,
     export.file_name = filename(task.name, output_format)
     export.status = "EXPORTED"
     # Drive upload is intentionally backend-only; metadata remains usable when Drive is not configured.
-    export.drive_file_id, export.drive_file_url = _upload_to_drive(task, export.file_name, content, output_format)
+    try:
+        export.drive_file_id, export.drive_file_url = _upload_to_drive(task, export.file_name, content, output_format)
+    except Exception as error:
+        database_session.rollback()
+        raise HTTPException(
+            status_code=502,
+            detail="Google Drive export failed. Check backend authentication and Task folder permissions.",
+        ) from error
     database_session.commit()
     database_session.refresh(export)
     return export
@@ -296,11 +330,8 @@ def download_export(task_id: int, export_id: int, _: AdminUser,
 def _upload_to_drive(task: Task, file_name: str, content: bytes, output_format: str) -> tuple[str | None, str | None]:
     if not task.drive_folder_id:
         return None, None
-    try:
-        from app.services.drive_service import upload_file
-        return upload_file(task.drive_folder_id, file_name, content, output_format)
-    except (ImportError, RuntimeError):
-        return None, None
+    from app.services.drive_service import upload_file
+    return upload_file(task.drive_folder_id, file_name, content, output_format)
 
 
 @router.post("/tasks/{task_id}/annotations", response_model=AnnotationRecordResponse, status_code=status.HTTP_201_CREATED)

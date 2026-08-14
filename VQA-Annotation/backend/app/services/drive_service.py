@@ -1,4 +1,5 @@
 import io
+import json
 import re
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -9,20 +10,82 @@ DRIVE_FILE_URL = "https://drive.google.com/file/d/{file_id}/view"
 DRIVE_FOLDER_URL = "https://drive.google.com/drive/folders/{folder_id}"
 
 
-def _service():
-    credentials_file = settings.google_drive_service_account_file
-    if not credentials_file:
-        raise RuntimeError("Google Drive service account is not configured.")
+def service_account_file() -> Path:
+    configured = settings.google_drive_service_account_file
+    if not configured:
+        raise RuntimeError("GOOGLE_DRIVE_SERVICE_ACCOUNT_FILE is not configured.")
+    credentials_file = Path(configured).expanduser()
+    if not credentials_file.is_absolute():
+        credentials_file = (Path(__file__).resolve().parents[2] / credentials_file).resolve()
+    if not credentials_file.is_file():
+        raise RuntimeError(f"Google Drive service-account file was not found: {credentials_file}")
     try:
+        metadata = json.loads(credentials_file.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"Google Drive credentials file is not valid JSON: {credentials_file}") from error
+    if not isinstance(metadata, dict) or metadata.get("type") != "service_account" or not metadata.get("client_email") or not metadata.get("private_key"):
+        raise RuntimeError("Google Drive credentials must be a service-account JSON key.")
+    return credentials_file
+
+
+def _credentials(scopes: list[str]):
+    try:
+        import google.auth
+        from google.oauth2.credentials import Credentials
         from google.oauth2 import service_account
+    except ImportError as error:
+        raise RuntimeError("Google Drive dependencies are not installed.") from error
+
+    if settings.google_drive_service_account_file:
+        return service_account.Credentials.from_service_account_file(
+            str(service_account_file()),
+            scopes=scopes,
+        )
+    oauth_values = (
+        settings.google_client_id,
+        settings.google_drive_oauth_client_secret,
+        settings.google_drive_oauth_refresh_token,
+    )
+    if any(oauth_values[1:]):
+        if not all(oauth_values):
+            raise RuntimeError(
+                "Google Drive OAuth configuration is incomplete. Set GOOGLE_CLIENT_ID, "
+                "GOOGLE_DRIVE_OAUTH_CLIENT_SECRET, and GOOGLE_DRIVE_OAUTH_REFRESH_TOKEN."
+            )
+        return Credentials(
+            token=None,
+            refresh_token=settings.google_drive_oauth_refresh_token,
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=settings.google_client_id,
+            client_secret=settings.google_drive_oauth_client_secret,
+            scopes=scopes,
+        )
+    try:
+        credentials, _ = google.auth.default(scopes=scopes)
+    except google.auth.exceptions.DefaultCredentialsError as error:
+        raise RuntimeError(
+            "Google Drive credentials are unavailable. Configure Application Default Credentials "
+            "for the production runtime, or set GOOGLE_DRIVE_SERVICE_ACCOUNT_FILE for local development."
+        ) from error
+    return credentials
+
+
+def _service(scopes: list[str] | None = None):
+    try:
         from googleapiclient.discovery import build
     except ImportError as error:
         raise RuntimeError("Google Drive dependencies are not installed.") from error
-    credentials = service_account.Credentials.from_service_account_file(
-        credentials_file,
-        scopes=["https://www.googleapis.com/auth/drive"],
-    )
+    credentials = _credentials(scopes or ["https://www.googleapis.com/auth/drive"])
     return build("drive", "v3", credentials=credentials, cache_discovery=False)
+
+
+def authentication_info() -> dict[str, str | None]:
+    if settings.google_drive_service_account_file:
+        metadata = json.loads(service_account_file().read_text(encoding="utf-8"))
+        return {"method": "service_account_file", "account_email": metadata.get("client_email")}
+    if settings.google_drive_oauth_refresh_token:
+        return {"method": "oauth_refresh_token", "account_email": settings.google_drive_account_email or None}
+    return {"method": "application_default_credentials", "account_email": settings.google_drive_account_email or None}
 
 
 def parse_drive_id(value: str, kind: str) -> str:
@@ -84,6 +147,8 @@ def download_pdf(file_id: str, destination: Path) -> dict:
     metadata = service.files().get(fileId=file_id, fields="id,name,mimeType,size,parents,webViewLink").execute()
     if metadata.get("mimeType") != "application/pdf" and not metadata.get("name", "").lower().endswith(".pdf"):
         raise ValueError("Selected Google Drive file is not a PDF.")
+    if settings.max_pdf_size_mb and int(metadata.get("size") or 0) > settings.max_pdf_size_mb * 1024 * 1024:
+        raise ValueError(f"The PDF exceeds the {settings.max_pdf_size_mb} MB size limit.")
     try:
         from googleapiclient.http import MediaIoBaseDownload
     except ImportError as error:
@@ -154,22 +219,13 @@ def delete_generated_pages(folder_id: str, image_prefix: str) -> None:
 
 
 def upload_file(folder_id: str, file_name: str, content: bytes, output_format: str) -> tuple[str, str]:
-    """Upload using a backend-only service-account file when configured."""
-    credentials_file = settings.google_drive_service_account_file
-    if not credentials_file:
-        raise RuntimeError("Google Drive service account is not configured.")
+    """Upload an export through the same backend-only Drive identity."""
     try:
-        from google.oauth2 import service_account
-        from googleapiclient.discovery import build
         from googleapiclient.http import MediaIoBaseUpload
     except ImportError as error:
         raise RuntimeError("Google Drive dependencies are not installed.") from error
 
-    credentials = service_account.Credentials.from_service_account_file(
-        credentials_file,
-        scopes=["https://www.googleapis.com/auth/drive.file"],
-    )
-    service = build("drive", "v3", credentials=credentials, cache_discovery=False)
+    service = _service(["https://www.googleapis.com/auth/drive.file"])
     folder_id = parse_drive_id(folder_id, "folder")
     media_type = "text/csv" if output_format == "CSV" else "application/json"
     query = f"'{folder_id}' in parents and name = '{file_name.replace(chr(39), chr(92) + chr(39))}' and trashed = false"

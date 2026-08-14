@@ -11,12 +11,91 @@ from pydantic import ValidationError
 
 from app.models.task import OutputType, TaskStatus
 from app.routers.document import SLIDE_NAME_PATTERN, delete_draft_annotation, generated_image_id, render_and_upload_pages, validate_question
+from app.routers.results import google_drive_health
 from app.schemas.document import DriveDocumentSelection, DriveLinkInput, SlideAnnotationBatchInput, SlideAnnotationInput
 from app.services.result_service import filename, final_dataset_records, flatten_record, fleiss_agreement_stats, serialize_records
 from app.services.gemini_service import generate_annotation, generate_annotations
+from app.services.drive_service import _credentials, service_account_file
 
 
 class Milestone3ValidationTests(unittest.TestCase):
+    @patch("app.services.drive_service.authentication_info")
+    @patch("app.services.drive_service.verify_writable_folder")
+    def test_drive_health_verifies_task_folder_without_upload(self, verify_writable_folder, authentication_info):
+        verify_writable_folder.return_value = "folder-id"
+        authentication_info.return_value = {
+            "method": "oauth_refresh_token",
+            "account_email": "backend@example.test",
+        }
+        database_session = MagicMock()
+        database_session.get.return_value = SimpleNamespace(
+            drive_folder_id="folder-id",
+            annotator_drive_folder_id=None,
+            admin_drive_folder_id=None,
+        )
+
+        result = google_drive_health(7, None, database_session)
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["account_email"], "backend@example.test")
+        verify_writable_folder.assert_called_once_with("folder-id")
+
+    @patch.dict("os.environ", {}, clear=True)
+    @patch("app.services.drive_service.settings.google_drive_service_account_file", "")
+    def test_drive_credentials_report_missing_configuration(self):
+        with self.assertRaisesRegex(RuntimeError, "GOOGLE_DRIVE_SERVICE_ACCOUNT_FILE"):
+            service_account_file()
+
+    @patch.dict("os.environ", {}, clear=True)
+    @patch("app.services.drive_service.settings.google_drive_service_account_file", "C:/missing/drive-key.json")
+    def test_drive_credentials_report_missing_file(self):
+        with self.assertRaisesRegex(RuntimeError, "was not found"):
+            service_account_file()
+
+    def test_drive_credentials_reject_non_service_account_json(self):
+        with TemporaryDirectory() as directory:
+            credentials_file = Path(directory) / "credentials.json"
+            credentials_file.write_text('{"type":"authorized_user"}', encoding="utf-8")
+            with patch("app.services.drive_service.settings.google_drive_service_account_file", str(credentials_file)):
+                with self.assertRaisesRegex(RuntimeError, "must be a service-account JSON key"):
+                    service_account_file()
+
+    @patch("google.auth.default")
+    @patch("app.services.drive_service.settings.google_drive_service_account_file", "")
+    def test_drive_credentials_support_application_default_credentials(self, google_auth_default):
+        credentials = MagicMock()
+        google_auth_default.return_value = (credentials, "vqa-annotation")
+
+        self.assertIs(_credentials(["drive-scope"]), credentials)
+        google_auth_default.assert_called_once_with(scopes=["drive-scope"])
+
+    @patch("google.oauth2.credentials.Credentials")
+    @patch("app.services.drive_service.settings.google_drive_oauth_refresh_token", "refresh-token")
+    @patch("app.services.drive_service.settings.google_drive_oauth_client_secret", "client-secret")
+    @patch("app.services.drive_service.settings.google_client_id", "client-id")
+    @patch("app.services.drive_service.settings.google_drive_service_account_file", "")
+    def test_drive_credentials_support_render_oauth_refresh_token(self, credentials_class):
+        credentials = MagicMock()
+        credentials_class.return_value = credentials
+
+        self.assertIs(_credentials(["drive-scope"]), credentials)
+        credentials_class.assert_called_once_with(
+            token=None,
+            refresh_token="refresh-token",
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id="client-id",
+            client_secret="client-secret",
+            scopes=["drive-scope"],
+        )
+
+    @patch("app.services.drive_service.settings.google_drive_oauth_refresh_token", "")
+    @patch("app.services.drive_service.settings.google_drive_oauth_client_secret", "")
+    @patch("app.services.drive_service.settings.google_client_id", "client-id")
+    @patch("app.services.drive_service.settings.google_drive_service_account_file", "")
+    def test_drive_credentials_reject_incomplete_oauth_configuration(self):
+        with self.assertRaisesRegex(RuntimeError, "OAuth configuration is incomplete"):
+            _credentials(["drive-scope"])
+
     @patch("app.routers.document.get_task")
     def test_published_annotation_cannot_be_deleted_as_draft(self, get_task):
         get_task.return_value = SimpleNamespace(status=TaskStatus.IN_PROGRESS)

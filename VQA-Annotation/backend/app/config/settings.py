@@ -17,6 +17,9 @@ class Settings(BaseSettings):
     admin_password: str = ""
     frontend_url: str = "http://localhost:5173"
     google_drive_service_account_file: str = ""
+    google_drive_oauth_client_secret: str = ""
+    google_drive_oauth_refresh_token: str = ""
+    google_drive_account_email: str = ""
     gemini_api_key: str = ""
     gemini_model: str = "gemini-flash-latest"
     storage_root: str = "storage"
@@ -37,7 +40,14 @@ class Settings(BaseSettings):
 
     @cached_property
     def cors_origins(self) -> list[str]:
-        return [self.frontend_url, "http://127.0.0.1:5173"]
+        configured = [
+            origin.strip().rstrip("/")
+            for origin in self.frontend_url.split(",")
+            if origin.strip()
+        ]
+        if self.environment != "production":
+            configured.extend(["http://localhost:5173", "http://127.0.0.1:5173"])
+        return list(dict.fromkeys(configured))
 
 
 settings = Settings()

@@ -247,7 +247,14 @@ async def upload_document(
             if not first_chunk.startswith(b"%PDF"):
                 raise HTTPException(status_code=415, detail="The uploaded file is not a valid PDF.")
             handle.write(first_chunk)
+            total_size = len(first_chunk)
             while chunk := await document.read(1024 * 1024):
+                total_size += len(chunk)
+                if settings.max_pdf_size_mb and total_size > settings.max_pdf_size_mb * 1024 * 1024:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"The PDF exceeds the {settings.max_pdf_size_mb} MB size limit.",
+                    )
                 handle.write(chunk)
         pages = render_and_upload_pages(temp_path, normalized_name, destination_id)
         stored_document = TaskDocument(
