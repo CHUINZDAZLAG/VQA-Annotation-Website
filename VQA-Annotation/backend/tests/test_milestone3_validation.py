@@ -33,6 +33,7 @@ from app.services.google_drive_oauth_service import (
     encrypt_refresh_token,
 )
 from app.services.storage_service import SupabaseImageStorage
+from app.main import storage_health_check
 
 
 class Milestone3ValidationTests(unittest.TestCase):
@@ -69,6 +70,13 @@ class Milestone3ValidationTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "must be private"):
             storage_service.check_bucket()
+
+    @patch("app.main.supabase_storage.check_bucket", side_effect=RuntimeError("bucket must be private"))
+    def test_storage_health_reports_private_bucket_requirement(self, _check_bucket):
+        self.assertEqual(storage_health_check(), {
+            "status": "unavailable",
+            "detail": "The configured Supabase Storage bucket must be private.",
+        })
 
     def test_supabase_storage_rejects_publishable_key(self):
         storage_service = SupabaseImageStorage()

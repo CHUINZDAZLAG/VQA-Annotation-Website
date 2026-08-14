@@ -42,6 +42,13 @@ def health_check() -> dict[str, str]:
 def storage_health_check() -> dict[str, str]:
     try:
         supabase_storage.check_bucket()
-    except Exception:
-        return {"status": "unavailable"}
+    except Exception as error:
+        message = str(error)
+        if "must be private" in message:
+            detail = "The configured Supabase Storage bucket must be private."
+        elif "not configured" in message or "contains a " in message:
+            detail = "Supabase Storage credentials are not configured for backend access."
+        else:
+            detail = "Supabase Storage bucket access failed."
+        return {"status": "unavailable", "detail": detail}
     return {"status": "ready"}
