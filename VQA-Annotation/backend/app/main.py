@@ -5,6 +5,7 @@ from app.config.database import Base, engine, migrate_main_annotator_fields, mig
 from app.config.settings import settings
 from app.models import AnnotationRecord, DocumentSlide, SlideAnnotation, Task, TaskAssignment, TaskDocument, TaskExport, User
 from app.routers import admin, auth, document, results, tasks, user
+from app.services.storage_service import supabase_storage
 
 app = FastAPI(title=settings.app_name)
 
@@ -35,3 +36,12 @@ app.include_router(document.router)
 @app.get("/health")
 def health_check() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/health/storage")
+def storage_health_check() -> dict[str, str]:
+    try:
+        supabase_storage.check_bucket()
+    except Exception:
+        return {"status": "unavailable"}
+    return {"status": "ready"}

@@ -28,11 +28,28 @@ from app.services.google_drive_oauth_service import (
     decrypt_refresh_token,
     encrypt_refresh_token,
 )
+from app.services.storage_service import SupabaseImageStorage
 
 
 class Milestone3ValidationTests(unittest.TestCase):
     def test_pdf_render_dpi_fits_constrained_production_memory(self):
         self.assertEqual(PAGE_RENDER_DPI, 150)
+
+    @patch("app.services.storage_service.requests.get")
+    def test_supabase_storage_readiness_checks_private_bucket(self, requests_get):
+        response = MagicMock(status_code=200)
+        requests_get.return_value = response
+        storage_service = SupabaseImageStorage()
+        storage_service.base_url = "https://project.supabase.co"
+        storage_service.service_role_key = "service-role"
+        storage_service.bucket = "slide-images"
+        storage_service.check_bucket()
+        response.raise_for_status.assert_called_once_with()
+        self.assertEqual(
+            requests_get.call_args.args[0],
+            "https://project.supabase.co/storage/v1/bucket/slide-images",
+        )
+        self.assertEqual(requests_get.call_args.kwargs["headers"]["Authorization"], "Bearer service-role")
 
     def test_dataset_package_deduplicates_images_and_keeps_document_split(self):
         document = TaskDocument(

@@ -96,6 +96,17 @@ class SupabaseImageStorage:
         response.raise_for_status()
         return storage_path
 
+    def check_bucket(self) -> None:
+        self.require_configuration()
+        response = requests.get(
+            f"{self.base_url}/storage/v1/bucket/{quote(self.bucket, safe='')}",
+            headers=self._headers(),
+            timeout=15,
+        )
+        if response.status_code == 404:
+            raise RuntimeError("Supabase Storage bucket is unavailable.")
+        response.raise_for_status()
+
     def download_image(self, storage_path: str) -> bytes:
         response = requests.get(
             self._object_url(storage_path),
