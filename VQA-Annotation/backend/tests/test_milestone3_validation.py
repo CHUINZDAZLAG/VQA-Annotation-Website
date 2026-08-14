@@ -7,9 +7,11 @@ from unittest.mock import MagicMock, patch
 
 import fitz
 from fastapi import HTTPException
+from oauthlib.oauth2 import OAuth2Error
 from pydantic import ValidationError
 
 from app.models.task import OutputType, TaskStatus
+from app.routers.auth import google_drive_callback
 from app.routers.document import SLIDE_NAME_PATTERN, delete_draft_annotation, generated_image_id, render_and_upload_pages, validate_question
 from app.routers.results import google_drive_health
 from app.schemas.document import DriveDocumentSelection, DriveLinkInput, SlideAnnotationBatchInput, SlideAnnotationInput
@@ -24,6 +26,23 @@ from app.services.google_drive_oauth_service import (
 
 
 class Milestone3ValidationTests(unittest.TestCase):
+    @patch("app.routers.auth.frontend_redirect", return_value="https://frontend.test/annotator?drive=error")
+    @patch("app.routers.auth.complete_authorization", side_effect=OAuth2Error(description="invalid_client"))
+    def test_drive_oauth_callback_redirects_token_exchange_errors(self, _, frontend_redirect):
+        database_session = MagicMock()
+
+        response = google_drive_callback(
+            state="oauth-state",
+            code="authorization-code",
+            error=None,
+            database_session=database_session,
+        )
+
+        self.assertEqual(response.status_code, 307)
+        self.assertEqual(response.headers["location"], "https://frontend.test/annotator?drive=error")
+        database_session.rollback.assert_called_once_with()
+        frontend_redirect.assert_called_once()
+
     @patch("app.services.google_drive_oauth_service._flow")
     @patch("app.services.google_drive_oauth_service.secrets.token_urlsafe", return_value="oauth-state")
     def test_drive_oauth_start_requests_offline_consent(self, _, flow_factory):

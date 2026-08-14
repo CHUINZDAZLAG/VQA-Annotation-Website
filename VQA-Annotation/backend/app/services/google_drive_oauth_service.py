@@ -107,8 +107,6 @@ def complete_authorization(database_session: Session, state: str, code: str) -> 
 
     user_id = state_record.user_id
     return_path = state_record.return_path
-    database_session.delete(state_record)
-    database_session.commit()
 
     flow = _flow(state)
     flow.fetch_token(code=code)
@@ -133,6 +131,7 @@ def complete_authorization(database_session: Session, state: str, code: str) -> 
     connection.google_email = google_email if isinstance(google_email, str) else None
     connection.encrypted_refresh_token = encrypt_refresh_token(credentials.refresh_token)
     connection.scopes = " ".join(credentials.scopes or DRIVE_SCOPES)
+    database_session.delete(state_record)
     database_session.commit()
     return user_id, return_path
 

@@ -3,7 +3,9 @@ from typing import Annotated
 import requests
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import RedirectResponse
+from oauthlib.oauth2 import OAuth2Error
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.config.database import get_db
 from app.middleware.auth import get_current_user, require_admin
@@ -55,7 +57,8 @@ def google_drive_callback(
         return RedirectResponse(frontend_redirect("/annotator", "error", error or "authorization_denied"))
     try:
         _, return_path = complete_authorization(database_session, state, code)
-    except (RuntimeError, ValueError, requests.RequestException) as callback_error:
+    except (OAuth2Error, RuntimeError, ValueError, requests.RequestException, SQLAlchemyError) as callback_error:
+        database_session.rollback()
         return RedirectResponse(frontend_redirect("/annotator", "error", str(callback_error)))
     return RedirectResponse(frontend_redirect(return_path, "connected"))
 
