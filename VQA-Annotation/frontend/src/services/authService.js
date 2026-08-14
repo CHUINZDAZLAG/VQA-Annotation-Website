@@ -1,4 +1,14 @@
-const apiBaseUrl = import.meta.env.VITE_API_URL ?? 'http://localhost:8000';
+const configuredApiBaseUrl = (import.meta.env.VITE_API_URL || 'http://localhost:8000').trim().replace(/\/$/, '');
+
+function apiUrl(path) {
+  try {
+    return new URL(path, `${configuredApiBaseUrl}/`).toString();
+  } catch {
+    throw new Error(
+      'VITE_API_URL is invalid. Set it to https://vqa-annotation-api.onrender.com in Vercel and redeploy.',
+    );
+  }
+}
 const portalKeys = {
   user: { access: 'vqa_user_access_token', refresh: 'vqa_user_refresh_token' },
   admin: { access: 'vqa_admin_access_token', refresh: 'vqa_admin_refresh_token' },
@@ -10,7 +20,7 @@ async function request(path, options = {}, portal = 'user') {
   const headers = new Headers(options.headers);
   if (accessToken) headers.set('Authorization', `Bearer ${accessToken}`);
 
-  const response = await fetch(`${apiBaseUrl}${path}`, {
+  const response = await fetch(apiUrl(path), {
     ...options,
     headers,
   });
@@ -106,7 +116,7 @@ export const authService = {
     method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ drive_folder_id: driveFolderId }),
   }, 'admin'),
   downloadTaskExport: async (taskId, exportId) => {
-    const response = await fetch(`${apiBaseUrl}/api/admin/tasks/${taskId}/exports/${exportId}/download`, {
+    const response = await fetch(apiUrl(`/api/admin/tasks/${taskId}/exports/${exportId}/download`), {
       headers: { Authorization: `Bearer ${localStorage.getItem(portalKeys.admin.access)}` },
     });
     if (!response.ok) throw new Error('Could not download export.');
@@ -159,14 +169,14 @@ export const authService = {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
   }),
   async getReviewSlideImage(taskId, slideId) {
-    const response = await fetch(`${apiBaseUrl}/api/tasks/${taskId}/review/slides/${slideId}/image`, {
+    const response = await fetch(apiUrl(`/api/tasks/${taskId}/review/slides/${slideId}/image`), {
       headers: { Authorization: `Bearer ${localStorage.getItem(portalKeys.user.access)}` },
     });
     if (!response.ok) throw new Error('Could not load review slide image.');
     return URL.createObjectURL(await response.blob());
   },
   async getBlindSlideImage(taskId, slideId) {
-    const response = await fetch(`${apiBaseUrl}/api/tasks/${taskId}/blind/slides/${slideId}/image`, {
+    const response = await fetch(apiUrl(`/api/tasks/${taskId}/blind/slides/${slideId}/image`), {
       headers: { Authorization: `Bearer ${localStorage.getItem(portalKeys.user.access)}` },
     });
     if (!response.ok) throw new Error('Could not load blind annotation slide image.');
@@ -174,7 +184,7 @@ export const authService = {
   },
   submitTaskAnnotation: (taskId) => request(`/api/tasks/${taskId}/submit`, { method: 'POST' }),
   async getTaskSlideImage(taskId, slideId) {
-    const response = await fetch(`${apiBaseUrl}/api/tasks/${taskId}/slides/${slideId}/image`, {
+    const response = await fetch(apiUrl(`/api/tasks/${taskId}/slides/${slideId}/image`), {
       headers: { Authorization: `Bearer ${localStorage.getItem(portalKeys.user.access)}` },
     });
     if (!response.ok) throw new Error('Could not load slide image.');
