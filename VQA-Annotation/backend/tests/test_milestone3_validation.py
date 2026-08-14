@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import json
 import io
@@ -8,7 +9,7 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import fitz
+import pymupdf
 from fastapi import HTTPException
 from oauthlib.oauth2 import OAuth2Error
 from pydantic import ValidationError
@@ -17,7 +18,7 @@ from app.models.annotation import AnnotationRecord
 from app.models.document import DocumentSlide, TaskDocument
 from app.models.task import OutputType, TaskStatus
 from app.routers.auth import google_drive_callback
-from app.routers.document import PAGE_RENDER_DPI, SLIDE_NAME_PATTERN, delete_draft_annotation, generated_image_id, render_and_upload_pages, save_annotation, validate_question
+from app.routers.document import PAGE_RENDER_DPI, SLIDE_NAME_PATTERN, delete_draft_annotation, generated_image_id, render_and_upload_pages, save_annotation, upload_document, validate_question
 from app.routers.results import google_drive_health
 from app.schemas.document import DriveDocumentSelection, DriveLinkInput, SlideAnnotationBatchInput, SlideAnnotationInput
 from app.services.result_service import DatasetItem, build_dataset_package, document_split, filename, final_dataset_records, flatten_record, fleiss_agreement_stats, serialize_records
@@ -289,7 +290,7 @@ class Milestone3ValidationTests(unittest.TestCase):
         ]
         with TemporaryDirectory() as directory:
             pdf_path = Path(directory) / "two-pages.pdf"
-            pdf = fitz.open()
+            pdf = pymupdf.open()
             pdf.new_page()
             pdf.new_page()
             pdf.save(pdf_path)
@@ -313,7 +314,7 @@ class Milestone3ValidationTests(unittest.TestCase):
         ]
         with TemporaryDirectory() as directory:
             pdf_path = Path(directory) / "two-pages.pdf"
-            pdf = fitz.open()
+            pdf = pymupdf.open()
             pdf.new_page()
             pdf.new_page()
             pdf.save(pdf_path)
@@ -321,6 +322,51 @@ class Milestone3ValidationTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Page 2"):
                 render_and_upload_pages(pdf_path, "deck", 42)
         delete_images.assert_called_once_with(["42/deck_Page01.png"])
+
+    @patch("app.routers.document.DocumentResponse.model_validate", return_value={"id": 7})
+    @patch("app.routers.document.get_slides", return_value=[{"image_id": "deck_Page01"}])
+    @patch("app.routers.document.replace_stored_document", return_value=[])
+    @patch("app.routers.document.render_and_upload_pages", return_value=[
+        (1, "deck_Page01", {"storage_path": "12/deck_Page01.png"}),
+    ])
+    @patch("app.routers.document.require_reprocessable_document")
+    @patch("app.routers.document.require_document_task")
+    def test_upload_document_returns_slides_with_authenticated_user(
+        self,
+        require_document_task,
+        _require_reprocessable_document,
+        _render_and_upload_pages,
+        _replace_stored_document,
+        get_slides,
+        _model_validate,
+    ):
+        task = SimpleNamespace(status=TaskStatus.WAITING_FOR_DOCUMENT)
+        require_document_task.return_value = task
+        database_session = MagicMock()
+        database_session.scalar.return_value = None
+        current_user = SimpleNamespace(id=23)
+
+        class UploadedPdf:
+            filename = "deck.pdf"
+            content_type = "application/pdf"
+
+            def __init__(self):
+                self.chunks = [b"%PDF-1.7\n", b""]
+
+            async def read(self, _size):
+                return self.chunks.pop(0)
+
+        result = asyncio.run(upload_document(
+            task_id=12,
+            current_user=current_user,
+            database_session=database_session,
+            document=UploadedPdf(),
+            slide_name="deck",
+            destination_drive_folder_id=None,
+        ))
+
+        self.assertEqual(result["slides"], [{"image_id": "deck_Page01"}])
+        get_slides.assert_called_once_with(12, current_user, database_session)
 
     def test_slide_name_rejects_paths_and_invalid_characters(self):
         self.assertIsNotNone(SLIDE_NAME_PATTERN.fullmatch("Training01"))

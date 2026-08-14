@@ -1,3 +1,4 @@
+import logging
 import re
 import tempfile
 from difflib import SequenceMatcher
@@ -5,7 +6,7 @@ from pathlib import Path
 from typing import Annotated
 from urllib.parse import quote
 
-import fitz
+import pymupdf
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse, Response
 from sqlalchemy import func, select
@@ -27,6 +28,7 @@ from app.services.result_service import filename, final_dataset_records, seriali
 from app.services.storage_service import storage, supabase_storage
 
 router = APIRouter(prefix="/api/tasks", tags=["main-annotator-document"])
+logger = logging.getLogger(__name__)
 MainAnnotator = Annotated[User, Depends(require_task_assignment(TaskType.MAIN_ANNOTATOR))]
 BlindAnnotator = Annotated[User, Depends(require_task_assignment(TaskType.BLIND_ANNOTATOR))]
 Reviewer = Annotated[User, Depends(require_task_assignment(TaskType.REVIEWER))]
@@ -95,7 +97,7 @@ def render_and_upload_pages(
     uploaded_pages: list[tuple[int, str, dict]] = []
     uploaded_paths: list[str] = []
     try:
-        with fitz.open(pdf_path) as pdf:
+        with pymupdf.open(pdf_path) as pdf:
             if pdf.page_count == 0:
                 raise HTTPException(status_code=422, detail="The PDF contains no pages.")
             for page_number in range(1, pdf.page_count + 1):
@@ -103,7 +105,7 @@ def render_and_upload_pages(
                 file_name = f"{image_id}.png"
                 try:
                     pixmap = pdf.load_page(page_number - 1).get_pixmap(
-                        matrix=fitz.Matrix(PAGE_RENDER_DPI / 72, PAGE_RENDER_DPI / 72), alpha=False,
+                        matrix=pymupdf.Matrix(PAGE_RENDER_DPI / 72, PAGE_RENDER_DPI / 72), alpha=False,
                     )
                     image_bytes = pixmap.tobytes("png")
                     storage_path = supabase_storage.upload_image(task_id, image_id, image_bytes)
@@ -326,13 +328,18 @@ async def upload_document(
         database_session.commit()
         supabase_storage.delete_images(stale_storage_paths)
         database_session.refresh(stored_document)
-        return {"document": DocumentResponse.model_validate(stored_document), "slides": get_slides(task_id, _, database_session)}
+        return {
+            "document": DocumentResponse.model_validate(stored_document),
+            "slides": get_slides(task_id, current_user, database_session),
+        }
     except HTTPException:
         database_session.rollback()
         raise
     except Exception as error:
         database_session.rollback()
-        raise HTTPException(status_code=422, detail=f"PDF processing failed: {drive_error_detail(error)}") from error
+        error_detail = drive_error_detail(error)
+        logger.warning("PDF processing failed for task %s: %s", task_id, error_detail)
+        raise HTTPException(status_code=422, detail=f"PDF processing failed: {error_detail}") from error
     finally:
         if temp_path:
             temp_path.unlink(missing_ok=True)
@@ -374,7 +381,10 @@ def select_drive_document(task_id: int, payload: DriveDocumentSelection, current
         database_session.commit()
         supabase_storage.delete_images(stale_storage_paths)
         database_session.refresh(stored_document)
-        return {"document": DocumentResponse.model_validate(stored_document), "slides": get_slides(task_id, _, database_session)}
+        return {
+            "document": DocumentResponse.model_validate(stored_document),
+            "slides": get_slides(task_id, current_user, database_session),
+        }
     except HTTPException:
         database_session.rollback()
         raise
