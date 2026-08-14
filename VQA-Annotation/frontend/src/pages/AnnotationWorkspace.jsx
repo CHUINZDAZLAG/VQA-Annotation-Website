@@ -150,16 +150,14 @@ export default function AnnotationWorkspace() {
       setTask(taskValue);
       setDriveLink(taskValue.drive_link || taskValue.drive_folder_url || "");
       setDriveFolderId(taskValue.annotator_drive_folder_id || taskValue.admin_drive_folder_id || taskValue.drive_folder_id || "");
-      try {
+      if (taskValue.document_page_count > 0) {
         const slideValues = await authService.getTaskSlides(taskId);
         setSlides(slideValues);
         const resumeIndex = slideValues.findIndex((slide) => slide.id === taskValue.current_slide_id);
         setSelectedIndex(resumeIndex >= 0 ? resumeIndex : 0);
         setSelectedAnnotationIndex(0);
         setSlideName(slideValues[0]?.slide_name || "");
-      } catch (slideError) {
-        if (!slideError.message.toLowerCase().includes("no document"))
-          throw slideError;
+      } else {
         setSlides([]);
       }
     } catch (requestError) {
