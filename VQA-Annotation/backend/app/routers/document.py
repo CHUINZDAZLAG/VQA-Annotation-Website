@@ -30,6 +30,7 @@ MainAnnotator = Annotated[User, Depends(require_task_assignment(TaskType.MAIN_AN
 BlindAnnotator = Annotated[User, Depends(require_task_assignment(TaskType.BLIND_ANNOTATOR))]
 Reviewer = Annotated[User, Depends(require_task_assignment(TaskType.REVIEWER))]
 SLIDE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _-]{0,254}$")
+PAGE_RENDER_DPI = 150
 
 
 def generated_image_id(slide_name: str, page_number: int) -> str:
@@ -102,7 +103,7 @@ def render_and_upload_pages(
                 file_name = f"{image_id}.png"
                 try:
                     image_bytes = pdf.load_page(page_number - 1).get_pixmap(
-                        matrix=fitz.Matrix(300 / 72, 300 / 72), alpha=False,
+                        matrix=fitz.Matrix(PAGE_RENDER_DPI / 72, PAGE_RENDER_DPI / 72), alpha=False,
                     ).tobytes("png")
                     uploaded = drive_service.upload_page(folder_id, file_name, image_bytes, user_id=user_id)
                 except Exception as error:

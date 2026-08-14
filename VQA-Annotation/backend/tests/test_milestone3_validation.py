@@ -12,7 +12,7 @@ from pydantic import ValidationError
 
 from app.models.task import OutputType, TaskStatus
 from app.routers.auth import google_drive_callback
-from app.routers.document import SLIDE_NAME_PATTERN, delete_draft_annotation, generated_image_id, render_and_upload_pages, validate_question
+from app.routers.document import PAGE_RENDER_DPI, SLIDE_NAME_PATTERN, delete_draft_annotation, generated_image_id, render_and_upload_pages, validate_question
 from app.routers.results import google_drive_health
 from app.schemas.document import DriveDocumentSelection, DriveLinkInput, SlideAnnotationBatchInput, SlideAnnotationInput
 from app.services.result_service import filename, final_dataset_records, flatten_record, fleiss_agreement_stats, serialize_records
@@ -27,6 +27,9 @@ from app.services.google_drive_oauth_service import (
 
 
 class Milestone3ValidationTests(unittest.TestCase):
+    def test_pdf_render_dpi_fits_constrained_production_memory(self):
+        self.assertEqual(PAGE_RENDER_DPI, 150)
+
     def test_drive_oauth_requests_profile_scope_returned_by_google(self):
         self.assertIn("https://www.googleapis.com/auth/userinfo.profile", DRIVE_SCOPES)
 

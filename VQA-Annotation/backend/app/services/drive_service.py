@@ -203,7 +203,7 @@ def upload_page(folder_id: str, file_name: str, content: bytes, user_id: int | N
     folder_id = parse_drive_id(folder_id, "folder")
     query = f"'{folder_id}' in parents and name = '{file_name.replace(chr(39), chr(92) + chr(39))}' and trashed = false"
     existing = service.files().list(q=query, fields="files(id,name,webViewLink)", pageSize=10).execute().get("files", [])
-    media = MediaIoBaseUpload(io.BytesIO(content), mimetype="image/png", resumable=True)
+    media = MediaIoBaseUpload(io.BytesIO(content), mimetype="image/png", resumable=False)
     metadata = {"name": file_name, "parents": [folder_id]}
     if existing:
         result = service.files().update(fileId=existing[0]["id"], body={"name": file_name}, media_body=media, fields="id,name,webViewLink").execute()
