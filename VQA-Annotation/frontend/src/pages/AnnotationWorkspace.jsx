@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useParams, useSearchParams } from "react-router-dom";
 import UserShell from "../components/UserShell";
 import { authService } from "../services/authService";
 
@@ -105,6 +105,7 @@ function formFromAnnotation(annotation, outputType) {
 
 export default function AnnotationWorkspace() {
   const { taskId } = useParams();
+  const [searchParams, setSearchParams] = useSearchParams();
   const [task, setTask] = useState(null);
   const [slides, setSlides] = useState([]);
   const [selectedIndex, setSelectedIndex] = useState(0);
@@ -121,6 +122,7 @@ export default function AnnotationWorkspace() {
   const [drivePdfs, setDrivePdfs] = useState([]);
   const [selectedPdfId, setSelectedPdfId] = useState("");
   const [driveLink, setDriveLink] = useState("");
+  const [driveConnection, setDriveConnection] = useState({ connected: false, account_email: null });
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [generating, setGenerating] = useState(false);
@@ -169,6 +171,18 @@ export default function AnnotationWorkspace() {
   useEffect(() => {
     load();
   }, [taskId]);
+  useEffect(() => {
+    const driveStatus = searchParams.get("drive");
+    const driveDetail = searchParams.get("detail");
+    authService.getGoogleDriveConnection()
+      .then((connection) => {
+        setDriveConnection(connection);
+        if (driveStatus === "connected") setMessage("Google Drive connected successfully.");
+      })
+      .catch((requestError) => setError(requestError.message));
+    if (driveStatus === "error") setError(driveDetail || "Google Drive connection failed.");
+    if (driveStatus) setSearchParams({}, { replace: true });
+  }, [searchParams, setSearchParams]);
   useEffect(() => {
     let active = true;
     let loadedImageUrl = "";
@@ -426,6 +440,10 @@ export default function AnnotationWorkspace() {
   }
   async function uploadDocument(event) {
     event.preventDefault();
+    if (!driveConnection.connected) {
+      setError("Connect Google Drive before uploading and processing a PDF.");
+      return;
+    }
     if (!uploadFile) {
       setError("Choose a PDF file first.");
       return;
@@ -458,6 +476,10 @@ export default function AnnotationWorkspace() {
   }
   async function listDrivePdfs(event) {
     event.preventDefault();
+    if (!driveConnection.connected) {
+      setError("Connect Google Drive before listing Drive files.");
+      return;
+    }
     if (!driveSourceFolderId.trim()) {
       setError("Enter a source Drive folder to list its PDFs.");
       return;
@@ -480,6 +502,10 @@ export default function AnnotationWorkspace() {
   }
   async function processDrivePdf(event) {
     event.preventDefault();
+    if (!driveConnection.connected) {
+      setError("Connect Google Drive before processing a Drive PDF.");
+      return;
+    }
     const pdfFileId = drivePdfInput.trim() || selectedPdfId;
     if (!pdfFileId || !slideName.trim() || !driveFolderId.trim()) {
       setError("Enter a Drive PDF, slide name, and destination Drive folder.");
@@ -526,6 +552,17 @@ export default function AnnotationWorkspace() {
       setError(requestError.message);
     } finally {
       setSaving(false);
+    }
+  }
+  async function connectGoogleDrive() {
+    try {
+      setError("");
+      const { authorization_url: authorizationUrl } = await authService.startGoogleDriveConnection(
+        `/tasks/${taskId}/annotate`,
+      );
+      window.location.assign(authorizationUrl);
+    } catch (requestError) {
+      setError(requestError.message);
     }
   }
   async function submit() {
@@ -591,7 +628,7 @@ export default function AnnotationWorkspace() {
           <button
             className="admin-action admin-action-primary"
             style={{ marginTop: 24 }}
-            disabled={saving}
+            disabled={saving || !driveConnection.connected}
             type="submit"
           >
             {saving
@@ -601,7 +638,7 @@ export default function AnnotationWorkspace() {
         </form>
       </section>
     ),
-    [slideName, uploadFile, driveFolderId, saving, slides.length],
+    [slideName, uploadFile, driveFolderId, saving, slides.length, driveConnection.connected],
   );
   const driveView = useMemo(
     () => (
@@ -662,7 +699,7 @@ export default function AnnotationWorkspace() {
             <button
               className="admin-action admin-action-primary"
               style={{ marginTop: 18 }}
-              disabled={saving}
+              disabled={saving || !driveConnection.connected}
               type="submit"
             >
               {saving ? "Processing..." : "Process selected PDF →"}
@@ -678,13 +715,13 @@ export default function AnnotationWorkspace() {
               placeholder="Source folder ID or URL"
             />
           </label>
-          <button className="admin-action admin-action-secondary" disabled={saving} type="submit">
+          <button className="admin-action admin-action-secondary" disabled={saving || !driveConnection.connected} type="submit">
             List PDFs
           </button>
         </form>
       </section>
     ),
-    [driveFolderId, driveSourceFolderId, drivePdfInput, drivePdfs, selectedPdfId, slideName, saving],
+    [driveFolderId, driveSourceFolderId, drivePdfInput, drivePdfs, selectedPdfId, slideName, saving, driveConnection.connected],
   );
   if (loading || (slides.length > 0 && !form))
     return (
@@ -706,6 +743,21 @@ export default function AnnotationWorkspace() {
         </Link>
       }
     >
+      <div className={driveConnection.connected ? "annotation-success" : "auth-error"} style={{ marginTop: 18 }}>
+        <span>
+          {driveConnection.connected
+            ? `Google Drive connected${driveConnection.account_email ? `: ${driveConnection.account_email}` : "."}`
+            : "Connect Google Drive before using Drive files or folders."}
+        </span>
+        <button
+          className="admin-action admin-action-secondary"
+          onClick={connectGoogleDrive}
+          style={{ marginLeft: 12 }}
+          type="button"
+        >
+          {driveConnection.connected ? "Reconnect Drive" : "Connect Google Drive"}
+        </button>
+      </div>
       {error && (
         <p className="auth-error" style={{ marginTop: 18 }}>
           {error}
