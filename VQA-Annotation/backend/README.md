@@ -7,7 +7,25 @@ FastAPI backend for the VQA Dataset Annotation Platform.
 `POST /api/auth/google` accepts a Google ID token, verifies its signature, audience,
 issuer, and expiration, then returns application-issued access and refresh tokens.
 Set `GOOGLE_CLIENT_ID`, `SECRET_KEY`, `ACCESS_TOKEN_EXPIRE_MINUTES`, and
-`REFRESH_TOKEN_EXPIRE_DAYS` in `.env`. No Google client secret or callback URI is used.
+`REFRESH_TOKEN_EXPIRE_DAYS` in `.env`. This sign-in flow is separate from Drive OAuth.
+
+## Per-user Google Drive OAuth
+
+An authenticated user starts Drive authorization with `GET /api/auth/google`. The backend
+returns an authorization URL requesting offline access and explicit consent. Google redirects
+to `GET /api/auth/google/callback`, where the backend exchanges the authorization code and
+stores an encrypted refresh token for that user only.
+
+Configure:
+
+```dotenv
+GOOGLE_DRIVE_OAUTH_CLIENT_ID=your_web_client_id
+GOOGLE_DRIVE_OAUTH_CLIENT_SECRET=your_web_client_secret
+GOOGLE_DRIVE_OAUTH_REDIRECT_URI=https://your-backend.onrender.com/api/auth/google/callback
+```
+
+Register the exact redirect URI on the Google OAuth Web Application. Client secrets and refresh
+tokens remain backend-only.
 
 ## Gemini annotation generation
 

@@ -57,6 +57,13 @@ export const authService = {
     return authentication.user;
   },
   getCurrentUser: () => request('/api/auth/me', {}, 'user'),
+  getGoogleDriveConnection: (portal = 'user') => request('/api/auth/google/drive/status', {}, portal),
+  startGoogleDriveConnection: (returnPath, portal = 'user') => request(
+    `/api/auth/google?return_path=${encodeURIComponent(returnPath)}`,
+    {},
+    portal,
+  ),
+  disconnectGoogleDrive: (portal = 'user') => request('/api/auth/google/drive', { method: 'DELETE' }, portal),
   getCurrentAdmin: () => request('/api/admin/auth/me', {}, 'admin'),
   async logout(portal = 'user') {
     try {

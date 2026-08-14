@@ -65,7 +65,7 @@ def drive_error_detail(error: Exception) -> str:
     return str(error)
 
 
-def effective_destination(task: Task, requested_folder: str | None) -> str:
+def effective_destination(task: Task, requested_folder: str | None, user_id: int) -> str:
     candidate = (
         requested_folder
         or task.annotator_drive_folder_id
@@ -75,7 +75,7 @@ def effective_destination(task: Task, requested_folder: str | None) -> str:
     if not candidate:
         raise HTTPException(status_code=422, detail="A destination Google Drive folder is required.")
     try:
-        folder_id = drive_service.verify_writable_folder(candidate)
+        folder_id = drive_service.verify_writable_folder(candidate, user_id=user_id)
     except Exception as error:
         raise HTTPException(status_code=422, detail=drive_error_detail(error)) from error
     if requested_folder:
@@ -85,7 +85,12 @@ def effective_destination(task: Task, requested_folder: str | None) -> str:
     return folder_id
 
 
-def render_and_upload_pages(pdf_path: Path, slide_name: str, folder_id: str) -> list[tuple[int, str, dict]]:
+def render_and_upload_pages(
+    pdf_path: Path,
+    slide_name: str,
+    folder_id: str,
+    user_id: int | None = None,
+) -> list[tuple[int, str, dict]]:
     uploaded_pages: list[tuple[int, str, dict]] = []
     created_file_ids: list[str] = []
     try:
@@ -99,7 +104,7 @@ def render_and_upload_pages(pdf_path: Path, slide_name: str, folder_id: str) -> 
                     image_bytes = pdf.load_page(page_number - 1).get_pixmap(
                         matrix=fitz.Matrix(300 / 72, 300 / 72), alpha=False,
                     ).tobytes("png")
-                    uploaded = drive_service.upload_page(folder_id, file_name, image_bytes)
+                    uploaded = drive_service.upload_page(folder_id, file_name, image_bytes, user_id=user_id)
                 except Exception as error:
                     raise RuntimeError(
                         f"Page {page_number} ({file_name}) failed: {drive_error_detail(error)}"
@@ -109,7 +114,10 @@ def render_and_upload_pages(pdf_path: Path, slide_name: str, folder_id: str) -> 
                 uploaded_pages.append((page_number, image_id, uploaded))
     except Exception:
         try:
-            drive_service.delete_files(created_file_ids)
+            if user_id is None:
+                drive_service.delete_files(created_file_ids)
+            else:
+                drive_service.delete_files(created_file_ids, user_id=user_id)
         except Exception:
             pass
         raise
@@ -222,7 +230,7 @@ def slide_response(
 @router.post("/{task_id}/document", response_model=dict, status_code=status.HTTP_201_CREATED)
 async def upload_document(
     task_id: int,
-    _: MainAnnotator,
+    current_user: MainAnnotator,
     database_session: Session = Depends(get_db),
     document: UploadFile = File(...),
     slide_name: str = Form(...),
@@ -238,7 +246,7 @@ async def upload_document(
         raise HTTPException(status_code=415, detail="Only PDF files are accepted.")
     temp_path: Path | None = None
     try:
-        destination_id = effective_destination(task, destination_drive_folder_id)
+        destination_id = effective_destination(task, destination_drive_folder_id, current_user.id)
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as handle:
             temp_path = Path(handle.name)
             first_chunk = await document.read(1024 * 1024)
@@ -256,7 +264,7 @@ async def upload_document(
                         detail=f"The PDF exceeds the {settings.max_pdf_size_mb} MB size limit.",
                     )
                 handle.write(chunk)
-        pages = render_and_upload_pages(temp_path, normalized_name, destination_id)
+        pages = render_and_upload_pages(temp_path, normalized_name, destination_id, current_user.id)
         stored_document = TaskDocument(
             task_id=task_id,
             original_filename=filename,
@@ -270,7 +278,7 @@ async def upload_document(
         task.status = TaskStatus.IN_PROGRESS
         database_session.commit()
         if stale_file_ids:
-            drive_service.delete_files(stale_file_ids)
+            drive_service.delete_files(stale_file_ids, user_id=current_user.id)
         database_session.refresh(stored_document)
         return {"document": DocumentResponse.model_validate(stored_document), "slides": get_slides(task_id, _, database_session)}
     except HTTPException:
@@ -285,17 +293,17 @@ async def upload_document(
 
 
 @router.get("/{task_id}/document/drive-files", response_model=list[dict])
-def list_drive_documents(task_id: int, folder_id: str, _: MainAnnotator,
+def list_drive_documents(task_id: int, folder_id: str, current_user: MainAnnotator,
                          database_session: Session = Depends(get_db)) -> list[dict]:
     get_task(task_id, database_session)
     try:
-        return drive_service.list_pdf_files(folder_id)
+        return drive_service.list_pdf_files(folder_id, user_id=current_user.id)
     except (ValueError, RuntimeError) as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
 
 
 @router.post("/{task_id}/document/select", response_model=dict, status_code=status.HTTP_201_CREATED)
-def select_drive_document(task_id: int, payload: DriveDocumentSelection, _: MainAnnotator,
+def select_drive_document(task_id: int, payload: DriveDocumentSelection, current_user: MainAnnotator,
                           database_session: Session = Depends(get_db)) -> dict:
     task = require_document_task(task_id, database_session)
     normalized_name = payload.slide_name.strip()
@@ -303,12 +311,14 @@ def select_drive_document(task_id: int, payload: DriveDocumentSelection, _: Main
         raise HTTPException(status_code=422, detail="slide_name contains invalid characters.")
     temp_path: Path | None = None
     try:
-        destination_id = effective_destination(task, payload.destination_folder_id or payload.folder_id)
+        destination_id = effective_destination(
+            task, payload.destination_folder_id or payload.folder_id, current_user.id,
+        )
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as handle:
             temp_path = Path(handle.name)
-        metadata = drive_service.download_pdf(payload.pdf_file_id, temp_path)
+        metadata = drive_service.download_pdf(payload.pdf_file_id, temp_path, user_id=current_user.id)
         old_document = database_session.scalar(select(TaskDocument).where(TaskDocument.task_id == task_id))
-        pages = render_and_upload_pages(temp_path, normalized_name, destination_id)
+        pages = render_and_upload_pages(temp_path, normalized_name, destination_id, current_user.id)
         stored_document = TaskDocument(
             task_id=task_id, original_filename=metadata["name"], slide_name=normalized_name,
             drive_folder_id=destination_id, source_pdf_file_id=metadata["id"], source_pdf_url=metadata.get("webViewLink"),
@@ -319,7 +329,7 @@ def select_drive_document(task_id: int, payload: DriveDocumentSelection, _: Main
         task.status = TaskStatus.IN_PROGRESS
         database_session.commit()
         if stale_file_ids:
-            drive_service.delete_files(stale_file_ids)
+            drive_service.delete_files(stale_file_ids, user_id=current_user.id)
         database_session.refresh(stored_document)
         return {"document": DocumentResponse.model_validate(stored_document), "slides": get_slides(task_id, _, database_session)}
     except HTTPException:
@@ -338,7 +348,7 @@ def save_drive_link(task_id: int, payload: DriveLinkInput, current_user: MainAnn
                     database_session: Session = Depends(get_db)) -> dict:
     task = get_task(task_id, database_session)
     try:
-        folder_id = drive_service.verify_writable_folder(payload.drive_link)
+        folder_id = drive_service.verify_writable_folder(payload.drive_link, user_id=current_user.id)
     except Exception as error:
         raise HTTPException(status_code=422, detail=drive_error_detail(error)) from error
     task.annotator_drive_folder_id = folder_id
@@ -410,7 +420,7 @@ def get_slide(task_id: int, slide_id: int, current_user: MainAnnotator, database
 
 
 @router.get("/{task_id}/slides/{slide_id}/image")
-def get_slide_image(task_id: int, slide_id: int, _: MainAnnotator, database_session: Session = Depends(get_db)) -> FileResponse:
+def get_slide_image(task_id: int, slide_id: int, current_user: MainAnnotator, database_session: Session = Depends(get_db)) -> FileResponse:
     slide = database_session.get(DocumentSlide, slide_id)
     if slide is None:
         raise HTTPException(status_code=404, detail="Slide not found.")
@@ -420,7 +430,9 @@ def get_slide_image(task_id: int, slide_id: int, _: MainAnnotator, database_sess
     image_path = Path(slide.image_reference).resolve()
     if slide.drive_file_id:
         try:
-            content, media_type = drive_service.download_file_bytes(slide.drive_file_id)
+            content, media_type = drive_service.download_file_bytes(
+                slide.drive_file_id, user_id=current_user.id,
+            )
             return Response(content=content, media_type=media_type)
         except (ValueError, RuntimeError) as error:
             raise HTTPException(status_code=404, detail="Drive slide image is unavailable.") from error
@@ -566,7 +578,9 @@ def generate_slide_annotation(task_id: int, slide_id: int, payload: GenerateAnno
     if document is None or document.task_id != task_id:
         raise HTTPException(status_code=404, detail="Slide not found.")
     try:
-        image_bytes, _ = drive_service.download_file_bytes(slide.drive_file_id) if slide.drive_file_id else (
+        image_bytes, _ = drive_service.download_file_bytes(
+            slide.drive_file_id, user_id=current_user.id,
+        ) if slide.drive_file_id else (
             Path(slide.image_reference).read_bytes(), "image/png"
         )
         generated_items = generate_annotations(
@@ -738,9 +752,9 @@ def list_blind_slides(task_id: int, _: BlindAnnotator, database_session: Session
 
 
 @router.get("/{task_id}/blind/slides/{slide_id}/image")
-def get_blind_slide_image(task_id: int, slide_id: int, _: BlindAnnotator,
+def get_blind_slide_image(task_id: int, slide_id: int, current_user: BlindAnnotator,
                           database_session: Session = Depends(get_db)) -> Response:
-    return get_slide_image_for_role(task_id, slide_id, database_session)
+    return get_slide_image_for_role(task_id, slide_id, database_session, current_user.id)
 
 
 @router.get("/{task_id}/review/slides", response_model=list[SlideResponse])
@@ -854,12 +868,12 @@ def save_reviewer_decision(task_id: int, slide_id: int, payload: DecisionInput, 
         record.final_status = "KEEP" if record.main_label == record.blind_label == record.reviewer_label == 1 else "REJECTED" if payload.decision == 0 else "PENDING"
     database_session.commit()
     if payload.decision == 1 and record and record.main_label == record.blind_label == record.reviewer_label == 1:
-        _export_final_dataset(database_session, task_id)
+        _export_final_dataset(database_session, task_id, current_user.id)
     database_session.refresh(annotation)
     return annotation
 
 
-def _export_final_dataset(database_session: Session, task_id: int) -> TaskExport:
+def _export_final_dataset(database_session: Session, task_id: int, user_id: int) -> TaskExport:
     task = get_task(task_id, database_session)
     if not task.drive_folder_id:
         raise HTTPException(status_code=422, detail="A Google Drive output folder is required before final acceptance.")
@@ -870,7 +884,9 @@ def _export_final_dataset(database_session: Session, task_id: int) -> TaskExport
     file_name = filename(task.name, output_format)
     from app.services.drive_service import upload_file
     try:
-        drive_file_id, drive_file_url = upload_file(task.drive_folder_id, file_name, content, output_format)
+        drive_file_id, drive_file_url = upload_file(
+            task.drive_folder_id, file_name, content, output_format, user_id=user_id,
+        )
     except (RuntimeError, ValueError) as error:
         raise HTTPException(status_code=502, detail=f"Final Google Drive export failed: {error}") from error
     export = database_session.scalar(select(TaskExport).where(
@@ -890,12 +906,17 @@ def _export_final_dataset(database_session: Session, task_id: int) -> TaskExport
 
 
 @router.get("/{task_id}/review/slides/{slide_id}/image")
-def get_review_slide_image(task_id: int, slide_id: int, _: Reviewer,
+def get_review_slide_image(task_id: int, slide_id: int, current_user: Reviewer,
                            database_session: Session = Depends(get_db)) -> Response:
-    return get_slide_image_for_role(task_id, slide_id, database_session)
+    return get_slide_image_for_role(task_id, slide_id, database_session, current_user.id)
 
 
-def get_slide_image_for_role(task_id: int, slide_id: int, database_session: Session) -> Response:
+def get_slide_image_for_role(
+    task_id: int,
+    slide_id: int,
+    database_session: Session,
+    user_id: int,
+) -> Response:
     slide = database_session.get(DocumentSlide, slide_id)
     if slide is None:
         raise HTTPException(status_code=404, detail="Slide not found.")
@@ -904,7 +925,7 @@ def get_slide_image_for_role(task_id: int, slide_id: int, database_session: Sess
         raise HTTPException(status_code=404, detail="Slide not found.")
     if slide.drive_file_id:
         try:
-            content, media_type = drive_service.download_file_bytes(slide.drive_file_id)
+            content, media_type = drive_service.download_file_bytes(slide.drive_file_id, user_id=user_id)
             return Response(content=content, media_type=media_type)
         except (ValueError, RuntimeError) as error:
             raise HTTPException(status_code=404, detail="Drive slide image is unavailable.") from error

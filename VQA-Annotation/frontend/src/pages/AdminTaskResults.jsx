@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Link, useParams } from 'react-router-dom';
+import { Link, useParams, useSearchParams } from 'react-router-dom';
 import { authService } from '../services/authService';
 import AdminShell from '../components/AdminShell';
 
@@ -12,6 +12,7 @@ function DecisionCell({ value }) {
 
 export default function AdminTaskResults() {
   const { taskId } = useParams();
+  const [searchParams, setSearchParams] = useSearchParams();
   const [task, setTask] = useState(null);
   const [result, setResult] = useState(null);
   const [exports, setExports] = useState([]);
@@ -19,6 +20,7 @@ export default function AdminTaskResults() {
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
   const [driveFolderId, setDriveFolderId] = useState('');
+  const [driveConnection, setDriveConnection] = useState({ connected: false, account_email: null });
 
   async function load() {
     try {
@@ -34,6 +36,20 @@ export default function AdminTaskResults() {
   }
 
   useEffect(() => { load(); }, [taskId, filters.output_type, filters.categories, filters.slide_type, filters.language, filters.search, filters.annotation_status, filters.main_annotator_decision, filters.blind_annotator_decision, filters.reviewer_decision]);
+  useEffect(() => {
+    authService.getGoogleDriveConnection('admin').then(setDriveConnection).catch(() => {});
+  }, []);
+  useEffect(() => {
+    const driveStatus = searchParams.get('drive');
+    if (!driveStatus) return;
+    if (driveStatus === 'connected') {
+      setMessage('Google Drive connected successfully.');
+      authService.getGoogleDriveConnection('admin').then(setDriveConnection).catch(() => {});
+    } else {
+      setError(searchParams.get('detail') || 'Google Drive connection failed.');
+    }
+    setSearchParams({}, { replace: true });
+  }, [searchParams, setSearchParams]);
 
   function changeFilter(event) {
     setFilters({ ...filters, [event.target.name]: event.target.value });
@@ -55,10 +71,20 @@ export default function AdminTaskResults() {
     } catch (requestError) { setError(requestError.message); }
   }
 
+  async function connectGoogleDrive() {
+    try {
+      const { authorization_url: authorizationUrl } = await authService.startGoogleDriveConnection(
+        `/admin/tasks/${taskId}/results`,
+        'admin',
+      );
+      window.location.assign(authorizationUrl);
+    } catch (requestError) { setError(requestError.message); }
+  }
+
   if (error && !result) return <main className="admin-loading-page">{error}</main>;
   const stats = result?.statistics;
   return (
-    <AdminShell eyebrow="Task Management / Results" title={task?.name || `Task Result #${taskId}`} subtitle="Inspect stored user-entered and system-generated dataset fields." actions={<div className="admin-detail-actions"><Link className="admin-action admin-action-secondary" to={`/admin/tasks/${taskId}`}>← &nbsp;Back to task</Link><button className="admin-action admin-action-primary" onClick={() => exportDataset('JSON')} type="button">Export JSON</button><button className="admin-action admin-action-secondary" onClick={() => exportDataset('CSV')} type="button">Export CSV</button></div>}>
+    <AdminShell eyebrow="Task Management / Results" title={task?.name || `Task Result #${taskId}`} subtitle="Inspect stored user-entered and system-generated dataset fields." actions={<div className="admin-detail-actions"><Link className="admin-action admin-action-secondary" to={`/admin/tasks/${taskId}`}>← &nbsp;Back to task</Link><button className="admin-action admin-action-secondary" onClick={connectGoogleDrive} type="button">{driveConnection.connected ? 'Reconnect Drive' : 'Connect Drive'}</button><button className="admin-action admin-action-primary" onClick={() => exportDataset('JSON')} type="button">Export JSON</button><button className="admin-action admin-action-secondary" onClick={() => exportDataset('CSV')} type="button">Export CSV</button></div>}>
       <div className="admin-results">
         {error && <p className="mt-4 text-amber-300">{error}</p>}
         {message && <p className="mt-4 text-emerald-300">{message}</p>}

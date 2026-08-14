@@ -24,15 +24,23 @@ Backend configuration belongs in `backend/.env`. Copy `backend/.env.example` and
 
 ### Google Drive setup
 
-The existing Drive service supports three credential sources, in this order:
+Each user connects their own Drive account from the annotation workspace. The backend requests
+offline access and explicit consent, then encrypts and stores a refresh token associated with
+that application user. Configure these backend-only Render variables:
 
-1. `GOOGLE_DRIVE_SERVICE_ACCOUNT_FILE` for local development where service-account keys are permitted.
-2. OAuth offline credentials (existing `GOOGLE_CLIENT_ID`, plus `GOOGLE_DRIVE_OAUTH_CLIENT_SECRET` and `GOOGLE_DRIVE_OAUTH_REFRESH_TOKEN`) for Render.
-3. Google Application Default Credentials for runtimes that provide workload identity.
+```dotenv
+GOOGLE_DRIVE_OAUTH_CLIENT_ID=your_google_web_client_id
+GOOGLE_DRIVE_OAUTH_CLIENT_SECRET=your_google_web_client_secret
+GOOGLE_DRIVE_OAUTH_REDIRECT_URI=https://vqa-annotation-api.onrender.com/api/auth/google/callback
+```
 
-For Render, create or reuse a Google OAuth client in project `vqa-annotation`, authorize a dedicated backend Google account for the Drive scope with offline access, and store the resulting client ID, client secret, and refresh token only in Render Environment Variables. Set `GOOGLE_DRIVE_ACCOUNT_EMAIL` to that account's email for health diagnostics. Do not put these values in Vercel or GitHub.
+Add the exact callback URI to the OAuth Web Application's Authorized redirect URIs. Do not put
+the client secret or refresh tokens in Vercel or GitHub. The legacy service-account and shared
+refresh-token modes remain available only for migration and local compatibility; user-facing
+Drive operations use the authenticated user's stored connection.
 
-Share source PDFs/folders with the configured backend account as Viewer and each destination Task folder as Editor. The Render production identity is the Google account represented by `GOOGLE_DRIVE_OAUTH_REFRESH_TOKEN`, not the service account. `iam.disableServiceAccountKeyCreation` remains enabled.
+Source PDFs/folders must be readable and destination Task folders writable by the Google account
+that the current user connected.
 
 The source PDF and destination folder are independent. Local PDF uploads also require a writable destination because generated page PNG files are uploaded to Drive immediately.
 

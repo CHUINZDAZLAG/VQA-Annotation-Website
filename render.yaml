@@ -29,9 +29,9 @@ services:
         value: 50
       - key: GEMINI_API_KEY
         sync: false
+      - key: GOOGLE_DRIVE_OAUTH_CLIENT_ID
+        sync: false
       - key: GOOGLE_DRIVE_OAUTH_CLIENT_SECRET
         sync: false
-      - key: GOOGLE_DRIVE_OAUTH_REFRESH_TOKEN
-        sync: false
-      - key: GOOGLE_DRIVE_ACCOUNT_EMAIL
+      - key: GOOGLE_DRIVE_OAUTH_REDIRECT_URI
         sync: false

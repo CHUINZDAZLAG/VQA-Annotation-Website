@@ -16,9 +16,43 @@ from app.schemas.document import DriveDocumentSelection, DriveLinkInput, SlideAn
 from app.services.result_service import filename, final_dataset_records, flatten_record, fleiss_agreement_stats, serialize_records
 from app.services.gemini_service import generate_annotation, generate_annotations
 from app.services.drive_service import _credentials, service_account_file
+from app.services.google_drive_oauth_service import (
+    authorization_url,
+    decrypt_refresh_token,
+    encrypt_refresh_token,
+)
 
 
 class Milestone3ValidationTests(unittest.TestCase):
+    @patch("app.services.google_drive_oauth_service._flow")
+    @patch("app.services.google_drive_oauth_service.secrets.token_urlsafe", return_value="oauth-state")
+    def test_drive_oauth_start_requests_offline_consent(self, _, flow_factory):
+        flow = MagicMock()
+        flow.authorization_url.return_value = ("https://accounts.google.test/authorize", "oauth-state")
+        flow_factory.return_value = flow
+        database_session = MagicMock()
+
+        result = authorization_url(database_session, 17, "/tasks/9/annotate")
+
+        self.assertEqual(result, "https://accounts.google.test/authorize")
+        flow_factory.assert_called_once_with("oauth-state")
+        flow.authorization_url.assert_called_once_with(
+            access_type="offline",
+            prompt="consent",
+            include_granted_scopes="true",
+        )
+        state_record = database_session.add.call_args.args[0]
+        self.assertEqual(state_record.user_id, 17)
+        self.assertEqual(state_record.return_path, "/tasks/9/annotate")
+        database_session.commit.assert_called_once()
+
+    @patch("app.services.google_drive_oauth_service.settings.secret_key", "test-secret-key-with-at-least-32-bytes")
+    def test_drive_refresh_token_is_encrypted_at_rest(self):
+        encrypted = encrypt_refresh_token("google-refresh-token")
+
+        self.assertNotIn("google-refresh-token", encrypted)
+        self.assertEqual(decrypt_refresh_token(encrypted), "google-refresh-token")
+
     @patch("app.services.drive_service.authentication_info")
     @patch("app.services.drive_service.verify_writable_folder")
     def test_drive_health_verifies_task_folder_without_upload(self, verify_writable_folder, authentication_info):
@@ -89,7 +123,7 @@ class Milestone3ValidationTests(unittest.TestCase):
         )
 
     @patch("app.services.drive_service.settings.google_drive_oauth_refresh_token", "")
-    @patch("app.services.drive_service.settings.google_drive_oauth_client_secret", "")
+    @patch("app.services.drive_service.settings.google_drive_oauth_client_secret", "client-secret")
     @patch("app.services.drive_service.settings.google_client_id", "client-id")
     @patch("app.services.drive_service.settings.google_drive_service_account_file", "")
     def test_drive_credentials_reject_incomplete_oauth_configuration(self):

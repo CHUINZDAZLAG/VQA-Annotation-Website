@@ -1,11 +1,14 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, status
+import requests
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import RedirectResponse
 from sqlalchemy import select
 
 from app.config.database import get_db
 from app.middleware.auth import get_current_user, require_admin
 from app.models.user import SystemRole, User
+from app.models.google_drive import GoogleDriveConnection
 from app.schemas.user import AdminLoginRequest, AuthenticationResponse, GoogleTokenRequest, TokenRefreshRequest, UserResponse
 from app.services.auth_service import (
     GoogleIdentityError,
@@ -18,10 +21,67 @@ from app.services.auth_service import (
     verify_google_id_token,
     verify_admin_credentials,
 )
+from app.services.google_drive_oauth_service import (
+    authorization_url,
+    complete_authorization,
+    frontend_redirect,
+)
 
 router = APIRouter(prefix="/api/auth", tags=["authentication"])
 admin_auth_router = APIRouter(prefix="/api/admin/auth", tags=["admin-authentication"])
 CurrentUser = Annotated[User, Depends(get_current_user)]
+
+
+@router.get("/google", response_model=dict)
+def connect_google_drive(
+    current_user: CurrentUser,
+    return_path: str = Query(default="/annotator"),
+    database_session=Depends(get_db),
+) -> dict:
+    try:
+        return {"authorization_url": authorization_url(database_session, current_user.id, return_path)}
+    except RuntimeError as error:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(error)) from error
+
+
+@router.get("/google/callback", response_class=RedirectResponse)
+def google_drive_callback(
+    state: str,
+    code: str | None = None,
+    error: str | None = None,
+    database_session=Depends(get_db),
+) -> RedirectResponse:
+    if error or not code:
+        return RedirectResponse(frontend_redirect("/annotator", "error", error or "authorization_denied"))
+    try:
+        _, return_path = complete_authorization(database_session, state, code)
+    except (RuntimeError, ValueError, requests.RequestException) as callback_error:
+        return RedirectResponse(frontend_redirect("/annotator", "error", str(callback_error)))
+    return RedirectResponse(frontend_redirect(return_path, "connected"))
+
+
+@router.get("/google/drive/status", response_model=dict)
+def google_drive_connection_status(
+    current_user: CurrentUser,
+    database_session=Depends(get_db),
+) -> dict:
+    connection = database_session.scalar(
+        select(GoogleDriveConnection).where(GoogleDriveConnection.user_id == current_user.id)
+    )
+    return {
+        "connected": connection is not None,
+        "account_email": connection.google_email if connection else None,
+    }
+
+
+@router.delete("/google/drive", status_code=status.HTTP_204_NO_CONTENT)
+def disconnect_google_drive(current_user: CurrentUser, database_session=Depends(get_db)) -> None:
+    connection = database_session.scalar(
+        select(GoogleDriveConnection).where(GoogleDriveConnection.user_id == current_user.id)
+    )
+    if connection:
+        database_session.delete(connection)
+        database_session.commit()
 
 
 @router.post("/google", response_model=AuthenticationResponse)

@@ -4,7 +4,12 @@ import re
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
+from sqlalchemy import select
+
+from app.config.database import SessionLocal
 from app.config.settings import settings
+from app.models.google_drive import GoogleDriveConnection
+from app.services.google_drive_oauth_service import decrypt_refresh_token
 
 DRIVE_FILE_URL = "https://drive.google.com/file/d/{file_id}/view"
 DRIVE_FOLDER_URL = "https://drive.google.com/drive/folders/{folder_id}"
@@ -28,7 +33,7 @@ def service_account_file() -> Path:
     return credentials_file
 
 
-def _credentials(scopes: list[str]):
+def _credentials(scopes: list[str], user_id: int | None = None):
     try:
         import google.auth
         from google.oauth2.credentials import Credentials
@@ -36,6 +41,23 @@ def _credentials(scopes: list[str]):
     except ImportError as error:
         raise RuntimeError("Google Drive dependencies are not installed.") from error
 
+    if user_id is not None:
+        with SessionLocal() as database_session:
+            connection = database_session.scalar(
+                select(GoogleDriveConnection).where(GoogleDriveConnection.user_id == user_id)
+            )
+        if connection is None:
+            raise RuntimeError("Connect Google Drive before using Drive files or folders.")
+        if not settings.google_drive_oauth_client_id or not settings.google_drive_oauth_client_secret:
+            raise RuntimeError("Google Drive OAuth client credentials are not configured.")
+        return Credentials(
+            token=None,
+            refresh_token=decrypt_refresh_token(connection.encrypted_refresh_token),
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=settings.google_drive_oauth_client_id,
+            client_secret=settings.google_drive_oauth_client_secret,
+            scopes=scopes,
+        )
     if settings.google_drive_service_account_file:
         return service_account.Credentials.from_service_account_file(
             str(service_account_file()),
@@ -70,16 +92,24 @@ def _credentials(scopes: list[str]):
     return credentials
 
 
-def _service(scopes: list[str] | None = None):
+def _service(scopes: list[str] | None = None, user_id: int | None = None):
     try:
         from googleapiclient.discovery import build
     except ImportError as error:
         raise RuntimeError("Google Drive dependencies are not installed.") from error
-    credentials = _credentials(scopes or ["https://www.googleapis.com/auth/drive"])
+    credentials = _credentials(scopes or ["https://www.googleapis.com/auth/drive"], user_id=user_id)
     return build("drive", "v3", credentials=credentials, cache_discovery=False)
 
 
-def authentication_info() -> dict[str, str | None]:
+def authentication_info(user_id: int | None = None) -> dict[str, str | None]:
+    if user_id is not None:
+        with SessionLocal() as database_session:
+            connection = database_session.scalar(
+                select(GoogleDriveConnection).where(GoogleDriveConnection.user_id == user_id)
+            )
+        if connection is None:
+            return {"method": "not_connected", "account_email": None}
+        return {"method": "user_oauth_refresh_token", "account_email": connection.google_email}
     if settings.google_drive_service_account_file:
         metadata = json.loads(service_account_file().read_text(encoding="utf-8"))
         return {"method": "service_account_file", "account_email": metadata.get("client_email")}
@@ -109,8 +139,8 @@ def folder_url(folder_id: str) -> str:
     return DRIVE_FOLDER_URL.format(folder_id=parse_drive_id(folder_id, "folder"))
 
 
-def verify_writable_folder(folder_id: str) -> str:
-    service = _service()
+def verify_writable_folder(folder_id: str, user_id: int | None = None) -> str:
+    service = _service(user_id=user_id)
     folder_id = parse_drive_id(folder_id, "folder")
     metadata = service.files().get(
         fileId=folder_id,
@@ -127,8 +157,8 @@ def verify_writable_folder(folder_id: str) -> str:
     return folder_id
 
 
-def list_pdf_files(folder_id: str) -> list[dict]:
-    service = _service()
+def list_pdf_files(folder_id: str, user_id: int | None = None) -> list[dict]:
+    service = _service(user_id=user_id)
     folder_id = parse_drive_id(folder_id, "folder")
     query = (
         f"'{folder_id}' in parents and trashed = false and "
@@ -141,8 +171,8 @@ def list_pdf_files(folder_id: str) -> list[dict]:
     return result.get("files", [])
 
 
-def download_pdf(file_id: str, destination: Path) -> dict:
-    service = _service()
+def download_pdf(file_id: str, destination: Path, user_id: int | None = None) -> dict:
+    service = _service(user_id=user_id)
     file_id = parse_drive_id(file_id, "file")
     metadata = service.files().get(fileId=file_id, fields="id,name,mimeType,size,parents,webViewLink").execute()
     if metadata.get("mimeType") != "application/pdf" and not metadata.get("name", "").lower().endswith(".pdf"):
@@ -164,8 +194,8 @@ def download_pdf(file_id: str, destination: Path) -> dict:
     return metadata
 
 
-def upload_page(folder_id: str, file_name: str, content: bytes) -> dict:
-    service = _service()
+def upload_page(folder_id: str, file_name: str, content: bytes, user_id: int | None = None) -> dict:
+    service = _service(user_id=user_id)
     try:
         from googleapiclient.http import MediaIoBaseUpload
     except ImportError as error:
@@ -185,16 +215,16 @@ def upload_page(folder_id: str, file_name: str, content: bytes) -> dict:
     return result
 
 
-def delete_files(file_ids: list[str]) -> None:
+def delete_files(file_ids: list[str], user_id: int | None = None) -> None:
     if not file_ids:
         return
-    service = _service()
+    service = _service(user_id=user_id)
     for file_id in file_ids:
         service.files().delete(fileId=parse_drive_id(file_id, "file"), supportsAllDrives=True).execute()
 
 
-def download_file_bytes(file_id: str) -> tuple[bytes, str]:
-    service = _service()
+def download_file_bytes(file_id: str, user_id: int | None = None) -> tuple[bytes, str]:
+    service = _service(user_id=user_id)
     try:
         from googleapiclient.http import MediaIoBaseDownload
     except ImportError as error:
@@ -208,8 +238,8 @@ def download_file_bytes(file_id: str) -> tuple[bytes, str]:
     return output.getvalue(), "image/png"
 
 
-def delete_generated_pages(folder_id: str, image_prefix: str) -> None:
-    service = _service()
+def delete_generated_pages(folder_id: str, image_prefix: str, user_id: int | None = None) -> None:
+    service = _service(user_id=user_id)
     folder_id = parse_drive_id(folder_id, "folder")
     query = f"'{folder_id}' in parents and name contains '{image_prefix}' and trashed = false"
     files = service.files().list(q=query, fields="files(id,name)", pageSize=1000).execute().get("files", [])
@@ -218,14 +248,20 @@ def delete_generated_pages(folder_id: str, image_prefix: str) -> None:
             service.files().delete(fileId=item["id"]).execute()
 
 
-def upload_file(folder_id: str, file_name: str, content: bytes, output_format: str) -> tuple[str, str]:
+def upload_file(
+    folder_id: str,
+    file_name: str,
+    content: bytes,
+    output_format: str,
+    user_id: int | None = None,
+) -> tuple[str, str]:
     """Upload an export through the same backend-only Drive identity."""
     try:
         from googleapiclient.http import MediaIoBaseUpload
     except ImportError as error:
         raise RuntimeError("Google Drive dependencies are not installed.") from error
 
-    service = _service(["https://www.googleapis.com/auth/drive.file"])
+    service = _service(["https://www.googleapis.com/auth/drive.file"], user_id=user_id)
     folder_id = parse_drive_id(folder_id, "folder")
     media_type = "text/csv" if output_format == "CSV" else "application/json"
     query = f"'{folder_id}' in parents and name = '{file_name.replace(chr(39), chr(92) + chr(39))}' and trashed = false"
