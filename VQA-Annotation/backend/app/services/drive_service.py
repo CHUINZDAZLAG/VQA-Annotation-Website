@@ -263,7 +263,10 @@ def upload_file(
 
     service = _service(["https://www.googleapis.com/auth/drive.file"], user_id=user_id)
     folder_id = parse_drive_id(folder_id, "folder")
-    media_type = "text/csv" if output_format == "CSV" else "application/json"
+    media_type = {
+        "CSV": "text/csv",
+        "ZIP": "application/zip",
+    }.get(output_format, "application/json")
     query = f"'{folder_id}' in parents and name = '{file_name.replace(chr(39), chr(92) + chr(39))}' and trashed = false"
     existing = service.files().list(
         q=query, fields="files(id,webViewLink)", pageSize=10,

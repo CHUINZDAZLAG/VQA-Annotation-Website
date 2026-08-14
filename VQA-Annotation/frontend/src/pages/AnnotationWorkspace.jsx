@@ -108,11 +108,13 @@ export default function AnnotationWorkspace() {
   const [searchParams, setSearchParams] = useSearchParams();
   const [task, setTask] = useState(null);
   const [slides, setSlides] = useState([]);
-  const [selectedIndex, setSelectedIndex] = useState(0);
+  const [selectedImageId, setSelectedImageId] = useState("");
   const [selectedAnnotationIndex, setSelectedAnnotationIndex] = useState(0);
   const [form, setForm] = useState(null);
   const [formDirty, setFormDirty] = useState(false);
   const [imageUrl, setImageUrl] = useState("");
+  const [imageLoading, setImageLoading] = useState(false);
+  const [imageError, setImageError] = useState("");
   const [uploadFile, setUploadFile] = useState(null);
   const [slideName, setSlideName] = useState("");
   const [sourceMode, setSourceMode] = useState("UPLOAD");
@@ -131,7 +133,11 @@ export default function AnnotationWorkspace() {
   const [expandedRows, setExpandedRows] = useState(() => new Set());
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
-  const selectedSlide = slides[selectedIndex];
+  const selectedIndex = useMemo(
+    () => Math.max(0, slides.findIndex((slide) => slide.image_id === selectedImageId)),
+    [slides, selectedImageId],
+  );
+  const selectedSlide = slides.find((slide) => slide.image_id === selectedImageId) || slides[0];
   const selectedAnnotations = selectedSlide?.annotations || [];
   const selectedAnnotation = selectedAnnotations[selectedAnnotationIndex] || null;
   const isMultipleChoice = task?.output_type === "MULTIPLE_CHOICE";
@@ -154,7 +160,7 @@ export default function AnnotationWorkspace() {
         const slideValues = await authService.getTaskSlides(taskId);
         setSlides(slideValues);
         const resumeIndex = slideValues.findIndex((slide) => slide.id === taskValue.current_slide_id);
-        setSelectedIndex(resumeIndex >= 0 ? resumeIndex : 0);
+        setSelectedImageId(slideValues[resumeIndex >= 0 ? resumeIndex : 0]?.image_id || "");
         setSelectedAnnotationIndex(0);
         setSlideName(slideValues[0]?.slide_name || "");
       } else {
@@ -187,22 +193,30 @@ export default function AnnotationWorkspace() {
     if (!selectedSlide || !task) return undefined;
     setSelectedAnnotationIndex(0);
     setExpandedRows(new Set());
+    setImageUrl("");
+    setImageLoading(true);
+    setImageError("");
     setForm(formFromAnnotation(selectedSlide.annotations?.[0], task.output_type));
     setFormDirty(false);
     authService.saveTaskDraftPosition(taskId, selectedSlide.id).catch(() => {});
     authService
-      .getTaskSlideImage(taskId, selectedSlide.id)
+      .getTaskImage(taskId, selectedSlide.image_id)
       .then((url) => {
         loadedImageUrl = url;
         if (active) setImageUrl(url);
         else URL.revokeObjectURL(url);
       })
-      .catch((requestError) => active && setError(requestError.message));
+      .catch((requestError) => {
+        if (active) setImageError(requestError.message || "Slide image is not available.");
+      })
+      .finally(() => {
+        if (active) setImageLoading(false);
+      });
     return () => {
       active = false;
       if (loadedImageUrl) URL.revokeObjectURL(loadedImageUrl);
     };
-  }, [selectedIndex, selectedSlide?.id, task?.output_type, taskId]);
+  }, [selectedSlide?.id, selectedSlide?.image_id, task?.output_type, taskId]);
 
   useEffect(() => {
     if (!selectedSlide || !task) return;
@@ -211,12 +225,6 @@ export default function AnnotationWorkspace() {
     setFormDirty(false);
   }, [selectedAnnotationIndex, selectedAnnotation?.id, selectedSlide?.id, task?.output_type]);
 
-  useEffect(() => {
-    if (!form?.annotation_id || !formDirty || saving || generating) return undefined;
-    const timer = window.setTimeout(() => saveCurrent(false), 900);
-    return () => window.clearTimeout(timer);
-  }, [form, formDirty, selectedSlide?.id]);
-
   const updateField = (field) => (event) => {
     setFormDirty(true);
     setForm((current) => ({ ...current, [field]: event.target.value }));
@@ -224,10 +232,6 @@ export default function AnnotationWorkspace() {
   async function updateInlineAnnotation(annotationIndex, update) {
     const annotation = selectedAnnotations[annotationIndex];
     if (!annotation) return;
-    if (annotationIndex !== selectedAnnotationIndex && formDirty) {
-      const saved = await saveCurrent(false);
-      if (!saved) return;
-    }
     const updated = update(formFromAnnotation(annotation, task.output_type));
     updateSelectedSlide(updated, annotationIndex);
     setSelectedAnnotationIndex(annotationIndex);
@@ -274,6 +278,7 @@ export default function AnnotationWorkspace() {
         selectedSlide.id,
         {
           annotation_id: form.annotation_id || null,
+          image_id: selectedSlide.image_id,
           categories: Number(form.categories),
           slide_type: Number(form.slide_type),
           language: Number(form.language),
@@ -287,7 +292,7 @@ export default function AnnotationWorkspace() {
       updateSelectedSlide(saved);
       setForm(formFromAnnotation(saved, task.output_type));
       setFormDirty(false);
-      if (showMessage) setMessage(saved.status === "COMPLETED" ? "Draft saved." : "Incomplete draft saved.");
+      if (showMessage) setMessage("Saved successfully.");
       setError("");
       return true;
     } catch (requestError) {
@@ -313,21 +318,26 @@ export default function AnnotationWorkspace() {
           edit_answer: form.edit_answer !== false,
         },
       );
+      const generatedPreviews = generatedAnnotations.map((annotation, index) => ({
+        ...annotation,
+        id: selectedAnnotations[index]?.id || null,
+        status: "NOT_STARTED",
+      }));
       setSlides((current) => current.map((slide) => slide.id === selectedSlide.id
         ? {
             ...slide,
-            annotations: generatedAnnotations,
-            annotation: generatedAnnotations[0] || null,
-            status: generatedAnnotations.every((annotation) => annotation.status === "COMPLETED")
+            annotations: generatedPreviews,
+            annotation: generatedPreviews[0] || null,
+            status: generatedPreviews.every((annotation) => annotation.status === "COMPLETED")
               ? "COMPLETED"
               : "IN_PROGRESS",
           }
         : slide));
       setSelectedAnnotationIndex(0);
-      setForm(formFromAnnotation(generatedAnnotations[0], task.output_type));
-      setFormDirty(false);
+      setForm(formFromAnnotation(generatedPreviews[0], task.output_type));
+      setFormDirty(true);
       setMessage(
-        "Gemini generated 10 labels for this slide. Review the table before publishing.",
+        "Gemini generated 10 labels for this slide. Review and explicitly save each label.",
       );
     } catch (requestError) {
       setError(requestError.message);
@@ -346,11 +356,11 @@ export default function AnnotationWorkspace() {
       if (!Array.isArray(items) || items.length !== 10) {
         throw new Error('JSON must be an array of 10 labels or an object with exactly 10 items in "annotations".');
       }
-      const importedAnnotations = await authService.importTaskSlideAnnotations(
-        taskId,
-        selectedSlide.id,
-        items.map((item) => normalizeImportedAnnotation(item, task.output_type)),
-      );
+      const importedAnnotations = items.map((item, index) => ({
+        ...normalizeImportedAnnotation(item, task.output_type),
+        id: selectedAnnotations[index]?.id || null,
+        status: "NOT_STARTED",
+      }));
       setSlides((current) => current.map((slide) => slide.id === selectedSlide.id
         ? {
             ...slide,
@@ -363,9 +373,9 @@ export default function AnnotationWorkspace() {
         : slide));
       setSelectedAnnotationIndex(0);
       setForm(formFromAnnotation(importedAnnotations[0], task.output_type));
-      setFormDirty(false);
+      setFormDirty(true);
       setExpandedRows(new Set());
-      setMessage("10 JSON labels imported as drafts. Open any row to review or edit it.");
+      setMessage("10 JSON labels loaded locally. Review and explicitly save each label.");
     } catch (requestError) {
       setError(requestError instanceof SyntaxError
         ? `Invalid JSON: ${requestError.message}`
@@ -376,7 +386,6 @@ export default function AnnotationWorkspace() {
   }
   async function toggleRow(index) {
     const isExpanded = expandedRows.has(index);
-    if (!isExpanded && index !== selectedAnnotationIndex && !(await saveCurrent(false))) return;
     setExpandedRows((current) => {
       const next = new Set(current);
       if (isExpanded) next.delete(index);
@@ -413,7 +422,7 @@ export default function AnnotationWorkspace() {
       setSelectedAnnotationIndex(nextIndex);
       setForm(formFromAnnotation(annotations[nextIndex], task.output_type));
       setFormDirty(false);
-      setMessage("Draft annotation deleted.");
+      setMessage("Saved annotation deleted.");
     } catch (requestError) {
       setError(requestError.message);
     } finally {
@@ -421,37 +430,26 @@ export default function AnnotationWorkspace() {
     }
   }
   async function move(offset) {
-    if (!(await saveCurrent(false))) return;
     setMessage("");
-    setSelectedIndex((current) => current + offset);
+    setSelectedImageId(slides[selectedIndex + offset]?.image_id || selectedImageId);
   }
   async function selectSlide(index) {
     if (index === selectedIndex) return;
-    if (!(await saveCurrent(false))) return;
     setMessage("");
-    setSelectedIndex(index);
+    setSelectedImageId(slides[index]?.image_id || "");
   }
   async function selectAnnotation(index) {
     if (index === selectedAnnotationIndex) return;
-    if (!(await saveCurrent(false))) return;
     setSelectedAnnotationIndex(index);
   }
   async function uploadDocument(event) {
     event.preventDefault();
-    if (!driveConnection.connected) {
-      setError("Connect Google Drive before uploading and processing a PDF.");
-      return;
-    }
     if (!uploadFile) {
       setError("Choose a PDF file first.");
       return;
     }
     if (!slideName.trim()) {
       setError("Slide name is required.");
-      return;
-    }
-    if (!driveFolderId.trim()) {
-      setError("Destination Google Drive folder is required.");
       return;
     }
     setSaving(true);
@@ -463,7 +461,7 @@ export default function AnnotationWorkspace() {
         driveFolderId.trim(),
       );
       setSlides(response.slides);
-      setSelectedIndex(0);
+      setSelectedImageId(response.slides[0]?.image_id || "");
       setMessage("PDF processed successfully.");
       setError("");
     } catch (requestError) {
@@ -505,8 +503,8 @@ export default function AnnotationWorkspace() {
       return;
     }
     const pdfFileId = drivePdfInput.trim() || selectedPdfId;
-    if (!pdfFileId || !slideName.trim() || !driveFolderId.trim()) {
-      setError("Enter a Drive PDF, slide name, and destination Drive folder.");
+    if (!pdfFileId || !slideName.trim()) {
+      setError("Enter a Drive PDF and slide name.");
       return;
     }
     setSaving(true);
@@ -518,7 +516,7 @@ export default function AnnotationWorkspace() {
         slide_name: slideName.trim(),
       });
       setSlides(response.slides);
-      setSelectedIndex(0);
+      setSelectedImageId(response.slides[0]?.image_id || "");
       setMessage("Google Drive PDF processed successfully.");
       setError("");
     } catch (requestError) {
@@ -564,13 +562,16 @@ export default function AnnotationWorkspace() {
     }
   }
   async function submit() {
+    if (formDirty) {
+      setError("Save the current annotation before submitting the task.");
+      return;
+    }
     if (completedCount !== slides.length) {
       setError(
         `Complete all slides before submitting (${completedCount} of ${slides.length}).`,
       );
       return;
     }
-    if (!(await saveCurrent(false))) return;
     try {
       await authService.submitTaskAnnotation(taskId);
       setTask((current) => ({ ...current, status: "SUBMITTED" }));
@@ -590,7 +591,7 @@ export default function AnnotationWorkspace() {
           {slides.length ? "Update PDF" : "Upload PDF"}
         </h2>
         <p className="admin-subtitle">
-          Every generated page image is uploaded to the destination folder immediately.
+          Every generated page image is stored in the task's private image storage.
         </p>
         <form onSubmit={uploadDocument}>
           <label className="auth-label">
@@ -613,20 +614,10 @@ export default function AnnotationWorkspace() {
               onChange={(event) => setSlideName(event.target.value)}
             />
           </label>
-          <label className="auth-label">
-            Destination Google Drive folder
-            <input
-              className="auth-input"
-              value={driveFolderId}
-              onChange={(event) => setDriveFolderId(event.target.value)}
-              placeholder="Folder ID or https://drive.google.com/drive/folders/..."
-              required
-            />
-          </label>
           <button
             className="admin-action admin-action-primary"
             style={{ marginTop: 24 }}
-            disabled={saving || !driveConnection.connected}
+            disabled={saving}
             type="submit"
           >
             {saving
@@ -636,7 +627,7 @@ export default function AnnotationWorkspace() {
         </form>
       </section>
     ),
-    [slideName, uploadFile, driveFolderId, saving, slides.length, driveConnection.connected],
+    [slideName, uploadFile, saving, slides.length],
   );
   const driveView = useMemo(
     () => (
@@ -684,16 +675,6 @@ export default function AnnotationWorkspace() {
                 required
               />
             </label>
-            <label className="auth-label">
-              Destination Google Drive folder
-              <input
-                className="auth-input"
-                value={driveFolderId}
-                onChange={(event) => setDriveFolderId(event.target.value)}
-                placeholder="Folder ID or folder URL"
-                required
-              />
-            </label>
             <button
               className="admin-action admin-action-primary"
               style={{ marginTop: 18 }}
@@ -719,7 +700,7 @@ export default function AnnotationWorkspace() {
         </form>
       </section>
     ),
-    [driveFolderId, driveSourceFolderId, drivePdfInput, drivePdfs, selectedPdfId, slideName, saving, driveConnection.connected],
+    [driveSourceFolderId, drivePdfInput, drivePdfs, selectedPdfId, slideName, saving, driveConnection.connected],
   );
   if (loading || (slides.length > 0 && !form))
     return (
@@ -857,7 +838,9 @@ export default function AnnotationWorkspace() {
           </div>
           <div className="annotation-layout annotation-main-layout">
             <section className="annotation-preview">
-              <img src={imageUrl} alt={selectedSlide.image_id} />
+              {imageLoading && <p className="admin-muted">Loading image...</p>}
+              {!imageLoading && imageError && <p className="admin-error">Slide image is not available.</p>}
+              {!imageLoading && !imageError && imageUrl && <img src={imageUrl} alt={selectedSlide.image_id} />}
               <div>
                 <strong>{selectedSlide.image_id}</strong>
                 <span>
@@ -1060,7 +1043,7 @@ export default function AnnotationWorkspace() {
                   disabled={saving}
                   type="submit"
                 >
-                  {saving ? "Saving..." : "Save Draft"}
+                  {saving ? "Saving..." : "Save"}
                 </button>
               </div>
             </form>
@@ -1077,7 +1060,7 @@ export default function AnnotationWorkspace() {
               onClick={submit}
               type="button"
             >
-              {task.status === "SUBMITTED" ? "Published" : "Publish Draft"}
+              {task.status === "SUBMITTED" ? "Published" : "Submit Task"}
             </button>
           </div>
         </>

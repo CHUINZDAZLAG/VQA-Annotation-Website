@@ -59,6 +59,7 @@ export default function AdminTaskResults() {
     try {
       const value = await authService.exportTask(taskId, format);
       setMessage(`Exported ${value.file_name}${value.drive_file_id ? ' to Google Drive.' : '.'}`);
+      if (format === 'ZIP') await authService.downloadTaskExport(taskId, value.id, value.file_name);
       await load();
     } catch (requestError) { setError(requestError.message); }
   }
@@ -84,7 +85,7 @@ export default function AdminTaskResults() {
   if (error && !result) return <main className="admin-loading-page">{error}</main>;
   const stats = result?.statistics;
   return (
-    <AdminShell eyebrow="Task Management / Results" title={task?.name || `Task Result #${taskId}`} subtitle="Inspect stored user-entered and system-generated dataset fields." actions={<div className="admin-detail-actions"><Link className="admin-action admin-action-secondary" to={`/admin/tasks/${taskId}`}>← &nbsp;Back to task</Link><button className="admin-action admin-action-secondary" onClick={connectGoogleDrive} type="button">{driveConnection.connected ? 'Reconnect Drive' : 'Connect Drive'}</button><button className="admin-action admin-action-primary" onClick={() => exportDataset('JSON')} type="button">Export JSON</button><button className="admin-action admin-action-secondary" onClick={() => exportDataset('CSV')} type="button">Export CSV</button></div>}>
+    <AdminShell eyebrow="Task Management / Results" title={task?.name || `Task Result #${taskId}`} subtitle="Inspect stored user-entered and system-generated dataset fields." actions={<div className="admin-detail-actions"><Link className="admin-action admin-action-secondary" to={`/admin/tasks/${taskId}`}>← &nbsp;Back to task</Link><button className="admin-action admin-action-secondary" onClick={connectGoogleDrive} type="button">{driveConnection.connected ? 'Reconnect Drive' : 'Connect Drive'}</button><button className="admin-action admin-action-primary" onClick={() => exportDataset('ZIP')} type="button">Export Dataset ZIP</button><button className="admin-action admin-action-secondary" onClick={() => exportDataset('JSON')} type="button">Export JSON</button><button className="admin-action admin-action-secondary" onClick={() => exportDataset('CSV')} type="button">Export CSV</button></div>}>
       <div className="admin-results">
         {error && <p className="mt-4 text-amber-300">{error}</p>}
         {message && <p className="mt-4 text-emerald-300">{message}</p>}

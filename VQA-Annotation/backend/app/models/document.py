@@ -58,6 +58,11 @@ class DocumentSlide(Base):
     drive_file_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     slide_name: Mapped[str] = mapped_column(String(255), nullable=False)
     image_reference: Mapped[str] = mapped_column(String(1024), nullable=False)
+    storage_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    width: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    height: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    file_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    mime_type: Mapped[str | None] = mapped_column(String(100), nullable=True)
     status: Mapped[SlideStatus] = mapped_column(
         Enum(SlideStatus, name="slide_status"), default=SlideStatus.NOT_STARTED, nullable=False
     )

@@ -3,6 +3,7 @@ import tempfile
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Annotated
+from urllib.parse import quote
 
 import fitz
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
@@ -19,11 +20,11 @@ from app.models.export import TaskExport
 from app.models.slide_annotation import SlideAnnotation
 from app.models.task import OutputType, Task, TaskStatus, TaskType
 from app.models.user import User
-from app.schemas.document import BlindAnnotationInput, DecisionInput, DocumentResponse, DraftPositionInput, DriveDocumentSelection, DriveLinkInput, GenerateAnnotationInput, SlideAnnotationBatchInput, SlideAnnotationInput, SlideAnnotationResponse, SlideResponse, SubmitResponse
+from app.schemas.document import BlindAnnotationInput, DecisionInput, DocumentResponse, DraftPositionInput, DriveDocumentSelection, DriveLinkInput, GenerateAnnotationInput, SlideAnnotationBatchInput, SlideAnnotationInput, SlideAnnotationPreview, SlideAnnotationResponse, SlideResponse, SubmitResponse
 from app.services import drive_service
 from app.services.gemini_service import generate_annotations
 from app.services.result_service import filename, final_dataset_records, serialize_records
-from app.services.storage_service import storage
+from app.services.storage_service import storage, supabase_storage
 
 router = APIRouter(prefix="/api/tasks", tags=["main-annotator-document"])
 MainAnnotator = Annotated[User, Depends(require_task_assignment(TaskType.MAIN_ANNOTATOR))]
@@ -34,7 +35,7 @@ PAGE_RENDER_DPI = 150
 
 
 def generated_image_id(slide_name: str, page_number: int) -> str:
-    return f"{slide_name}_page_{page_number:02d}"
+    return f"{slide_name}_Page{page_number:02d}"
 
 
 def get_task(task_id: int, database_session: Session) -> Task:
@@ -89,11 +90,10 @@ def effective_destination(task: Task, requested_folder: str | None, user_id: int
 def render_and_upload_pages(
     pdf_path: Path,
     slide_name: str,
-    folder_id: str,
-    user_id: int | None = None,
+    task_id: int,
 ) -> list[tuple[int, str, dict]]:
     uploaded_pages: list[tuple[int, str, dict]] = []
-    created_file_ids: list[str] = []
+    uploaded_paths: list[str] = []
     try:
         with fitz.open(pdf_path) as pdf:
             if pdf.page_count == 0:
@@ -102,23 +102,27 @@ def render_and_upload_pages(
                 image_id = generated_image_id(slide_name, page_number)
                 file_name = f"{image_id}.png"
                 try:
-                    image_bytes = pdf.load_page(page_number - 1).get_pixmap(
+                    pixmap = pdf.load_page(page_number - 1).get_pixmap(
                         matrix=fitz.Matrix(PAGE_RENDER_DPI / 72, PAGE_RENDER_DPI / 72), alpha=False,
-                    ).tobytes("png")
-                    uploaded = drive_service.upload_page(folder_id, file_name, image_bytes, user_id=user_id)
+                    )
+                    image_bytes = pixmap.tobytes("png")
+                    storage_path = supabase_storage.upload_image(task_id, image_id, image_bytes)
+                    uploaded = {
+                        "storage_path": storage_path,
+                        "width": pixmap.width,
+                        "height": pixmap.height,
+                        "file_size": len(image_bytes),
+                        "mime_type": "image/png",
+                    }
                 except Exception as error:
                     raise RuntimeError(
-                        f"Page {page_number} ({file_name}) failed: {drive_error_detail(error)}"
+                        f"Page {page_number} ({file_name}) failed: {error}"
                     ) from error
-                if uploaded.get("created"):
-                    created_file_ids.append(uploaded["id"])
+                uploaded_paths.append(storage_path)
                 uploaded_pages.append((page_number, image_id, uploaded))
     except Exception:
         try:
-            if user_id is None:
-                drive_service.delete_files(created_file_ids)
-            else:
-                drive_service.delete_files(created_file_ids, user_id=user_id)
+            supabase_storage.delete_images(uploaded_paths)
         except Exception:
             pass
         raise
@@ -132,39 +136,76 @@ def replace_stored_document(
     stored_document: TaskDocument,
     pages: list[tuple[int, str, dict]],
 ) -> list[str]:
-    old_drive_file_ids: list[str] = []
+    stale_storage_paths: list[str] = []
     if existing:
-        old_slides = list(database_session.scalars(
-            select(DocumentSlide).where(DocumentSlide.document_id == existing.id)
-        ))
-        old_drive_file_ids = [slide.drive_file_id for slide in old_slides if slide.drive_file_id]
-        old_image_ids = {slide.image_id for slide in old_slides}
-        if old_image_ids:
-            database_session.query(AnnotationRecord).filter(
-                AnnotationRecord.task_id == task_id,
-                AnnotationRecord.image_id.in_(old_image_ids),
-            ).delete(synchronize_session=False)
-        if old_slides:
-            database_session.query(SlideAnnotation).filter(
-                SlideAnnotation.slide_id.in_([slide.id for slide in old_slides])
-            ).delete(synchronize_session=False)
-        database_session.delete(existing)
-        database_session.flush()
-    database_session.add(stored_document)
+        target_document = existing
+        target_document.original_filename = stored_document.original_filename
+        target_document.slide_name = stored_document.slide_name
+        target_document.drive_folder_id = stored_document.drive_folder_id
+        target_document.source_pdf_file_id = stored_document.source_pdf_file_id
+        target_document.source_pdf_url = stored_document.source_pdf_url
+        target_document.storage_reference = stored_document.storage_reference
+        target_document.processing_status = stored_document.processing_status
+        target_document.page_count = stored_document.page_count
+        old_slides = {
+            slide.image_id: slide
+            for slide in database_session.scalars(
+                select(DocumentSlide).where(DocumentSlide.document_id == existing.id)
+            )
+        }
+        old_slides_by_page = {slide.page_number: slide for slide in old_slides.values()}
+    else:
+        target_document = stored_document
+        old_slides = {}
+        old_slides_by_page = {}
+        database_session.add(target_document)
     database_session.flush()
+    current_image_ids: set[str] = set()
     for page_number, image_id, uploaded in pages:
-        database_session.add(DocumentSlide(
-            document_id=stored_document.id,
-            page_number=page_number,
-            image_id=image_id,
-            drive_folder_id=stored_document.drive_folder_id,
-            drive_file_id=uploaded["id"],
-            drive_file_url=uploaded["webViewLink"],
-            slide_name=stored_document.slide_name,
-            image_reference=uploaded["webViewLink"],
-        ))
-    current_ids = {uploaded["id"] for _, _, uploaded in pages}
-    return [file_id for file_id in old_drive_file_ids if file_id not in current_ids]
+        current_image_ids.add(image_id)
+        slide = old_slides.get(image_id) or old_slides_by_page.get(page_number)
+        if slide is None:
+            slide = DocumentSlide(document_id=target_document.id, image_id=image_id)
+            database_session.add(slide)
+        else:
+            current_image_ids.add(slide.image_id)
+            slide.image_id = image_id
+        slide.page_number = page_number
+        slide.slide_name = target_document.slide_name
+        slide.drive_folder_id = None
+        slide.drive_file_id = None
+        slide.drive_file_url = None
+        slide.storage_path = uploaded["storage_path"]
+        slide.image_reference = f"supabase:{uploaded['storage_path']}"
+        slide.width = uploaded["width"]
+        slide.height = uploaded["height"]
+        slide.file_size = uploaded["file_size"]
+        slide.mime_type = uploaded["mime_type"]
+    current_slide_ids = {slide.id for slide in old_slides.values() if slide.image_id in current_image_ids}
+    for slide in old_slides.values():
+        if slide.id not in current_slide_ids:
+            if slide.storage_path:
+                stale_storage_paths.append(slide.storage_path)
+            database_session.delete(slide)
+    return stale_storage_paths
+
+
+def require_reprocessable_document(database_session: Session, existing: TaskDocument | None) -> None:
+    if existing is None:
+        return
+    slide_ids = list(database_session.scalars(
+        select(DocumentSlide.id).where(DocumentSlide.document_id == existing.id)
+    ))
+    if slide_ids and database_session.scalar(
+        select(func.count()).select_from(SlideAnnotation).where(
+            SlideAnnotation.slide_id.in_(slide_ids),
+            SlideAnnotation.is_deleted.is_(False),
+        )
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="This document already has saved annotations and cannot be replaced.",
+        )
 
 
 def validate_question(task: Task, payload: SlideAnnotationInput) -> None:
@@ -221,7 +262,12 @@ def slide_response(
         drive_file_url=slide.drive_file_url,
         slide_name=slide.slide_name,
         image_reference=slide.image_reference,
-        image_url=f"/api/tasks/{task_id}/slides/{slide.id}/image",
+        storage_path=slide.storage_path,
+        width=slide.width,
+        height=slide.height,
+        file_size=slide.file_size,
+        mime_type=slide.mime_type,
+        image_url=f"/api/tasks/{task_id}/images/{quote(slide.image_id, safe='')}",
         status=slide.status,
         annotation=annotation_response(legacy_annotation),
         annotations=[annotation_response(annotation) for annotation in visible_annotations],
@@ -247,7 +293,7 @@ async def upload_document(
         raise HTTPException(status_code=415, detail="Only PDF files are accepted.")
     temp_path: Path | None = None
     try:
-        destination_id = effective_destination(task, destination_drive_folder_id, current_user.id)
+        require_reprocessable_document(database_session, existing)
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as handle:
             temp_path = Path(handle.name)
             first_chunk = await document.read(1024 * 1024)
@@ -265,21 +311,20 @@ async def upload_document(
                         detail=f"The PDF exceeds the {settings.max_pdf_size_mb} MB size limit.",
                     )
                 handle.write(chunk)
-        pages = render_and_upload_pages(temp_path, normalized_name, destination_id, current_user.id)
+        pages = render_and_upload_pages(temp_path, normalized_name, task_id)
         stored_document = TaskDocument(
             task_id=task_id,
             original_filename=filename,
             slide_name=normalized_name,
-            drive_folder_id=destination_id,
+            drive_folder_id=None,
             storage_reference=f"upload:{filename}",
             processing_status=ProcessingStatus.PROCESSED,
             page_count=len(pages),
         )
-        stale_file_ids = replace_stored_document(database_session, task_id, existing, stored_document, pages)
+        stale_storage_paths = replace_stored_document(database_session, task_id, existing, stored_document, pages)
         task.status = TaskStatus.IN_PROGRESS
         database_session.commit()
-        if stale_file_ids:
-            drive_service.delete_files(stale_file_ids, user_id=current_user.id)
+        supabase_storage.delete_images(stale_storage_paths)
         database_session.refresh(stored_document)
         return {"document": DocumentResponse.model_validate(stored_document), "slides": get_slides(task_id, _, database_session)}
     except HTTPException:
@@ -312,25 +357,22 @@ def select_drive_document(task_id: int, payload: DriveDocumentSelection, current
         raise HTTPException(status_code=422, detail="slide_name contains invalid characters.")
     temp_path: Path | None = None
     try:
-        destination_id = effective_destination(
-            task, payload.destination_folder_id or payload.folder_id, current_user.id,
-        )
+        old_document = database_session.scalar(select(TaskDocument).where(TaskDocument.task_id == task_id))
+        require_reprocessable_document(database_session, old_document)
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as handle:
             temp_path = Path(handle.name)
         metadata = drive_service.download_pdf(payload.pdf_file_id, temp_path, user_id=current_user.id)
-        old_document = database_session.scalar(select(TaskDocument).where(TaskDocument.task_id == task_id))
-        pages = render_and_upload_pages(temp_path, normalized_name, destination_id, current_user.id)
+        pages = render_and_upload_pages(temp_path, normalized_name, task_id)
         stored_document = TaskDocument(
             task_id=task_id, original_filename=metadata["name"], slide_name=normalized_name,
-            drive_folder_id=destination_id, source_pdf_file_id=metadata["id"], source_pdf_url=metadata.get("webViewLink"),
+            drive_folder_id=None, source_pdf_file_id=metadata["id"], source_pdf_url=metadata.get("webViewLink"),
             storage_reference=f"drive:{metadata['id']}", processing_status=ProcessingStatus.PROCESSED,
             page_count=len(pages),
         )
-        stale_file_ids = replace_stored_document(database_session, task_id, old_document, stored_document, pages)
+        stale_storage_paths = replace_stored_document(database_session, task_id, old_document, stored_document, pages)
         task.status = TaskStatus.IN_PROGRESS
         database_session.commit()
-        if stale_file_ids:
-            drive_service.delete_files(stale_file_ids, user_id=current_user.id)
+        supabase_storage.delete_images(stale_storage_paths)
         database_session.refresh(stored_document)
         return {"document": DocumentResponse.model_validate(stored_document), "slides": get_slides(task_id, _, database_session)}
     except HTTPException:
@@ -421,25 +463,52 @@ def get_slide(task_id: int, slide_id: int, current_user: MainAnnotator, database
 
 
 @router.get("/{task_id}/slides/{slide_id}/image")
-def get_slide_image(task_id: int, slide_id: int, current_user: MainAnnotator, database_session: Session = Depends(get_db)) -> FileResponse:
+def get_slide_image(task_id: int, slide_id: int, current_user: MainAnnotator, database_session: Session = Depends(get_db)) -> Response:
     slide = database_session.get(DocumentSlide, slide_id)
     if slide is None:
         raise HTTPException(status_code=404, detail="Slide not found.")
     document = database_session.get(TaskDocument, slide.document_id)
     if document is None or document.task_id != task_id:
         raise HTTPException(status_code=404, detail="Slide not found.")
-    image_path = Path(slide.image_reference).resolve()
+    return image_response(slide, task_id, current_user.id)
+
+
+@router.get("/{task_id}/images/{image_id}")
+def get_task_image(task_id: int, image_id: str, current_user: MainAnnotator,
+                   database_session: Session = Depends(get_db)) -> Response:
+    slide = database_session.scalar(
+        select(DocumentSlide)
+        .join(TaskDocument, TaskDocument.id == DocumentSlide.document_id)
+        .where(TaskDocument.task_id == task_id, DocumentSlide.image_id == image_id)
+    )
+    if slide is None:
+        raise HTTPException(status_code=404, detail="Slide image does not belong to this task.")
+    return image_response(slide, task_id, current_user.id)
+
+
+def read_image_bytes(slide: DocumentSlide, task_id: int, user_id: int | None = None) -> tuple[bytes, str]:
+    if slide.storage_path:
+        try:
+            return supabase_storage.download_image(slide.storage_path), slide.mime_type or "image/png"
+        except Exception as error:
+            print(
+                f"Slide image unavailable task_id={task_id} image_id={slide.image_id} "
+                f"path={slide.storage_path}: {error}"
+            )
+            raise HTTPException(status_code=404, detail="Slide image is not available.") from error
     if slide.drive_file_id:
         try:
-            content, media_type = drive_service.download_file_bytes(
-                slide.drive_file_id, user_id=current_user.id,
-            )
-            return Response(content=content, media_type=media_type)
+            return drive_service.download_file_bytes(slide.drive_file_id, user_id=user_id)
         except (ValueError, RuntimeError) as error:
             raise HTTPException(status_code=404, detail="Drive slide image is unavailable.") from error
     if not image_path.is_relative_to(storage.task_root(task_id).resolve()) or not image_path.is_file():
         raise HTTPException(status_code=404, detail="Slide image is not available.")
-    return FileResponse(image_path, media_type="image/png")
+    return image_path.read_bytes(), "image/png"
+
+
+def image_response(slide: DocumentSlide, task_id: int, user_id: int | None = None) -> Response:
+    content, media_type = read_image_bytes(slide, task_id, user_id)
+    return Response(content=content, media_type=media_type)
 
 
 @router.get("/{task_id}/slides/{slide_id}/annotation", response_model=SlideAnnotationResponse | None)
@@ -475,6 +544,12 @@ def save_annotation(
     document = database_session.get(TaskDocument, slide.document_id)
     if document is None or document.task_id != task_id:
         raise HTTPException(status_code=404, detail="Slide not found.")
+    if payload.image_id != slide.image_id:
+        raise HTTPException(
+            status_code=409,
+            detail="Annotation image_id does not match the selected slide image.",
+        )
+    validate_question(task, payload)
     annotation = None
     if payload.annotation_id is not None:
         annotation = database_session.get(SlideAnnotation, payload.annotation_id)
@@ -501,12 +576,8 @@ def save_annotation(
     annotation.insight = payload.insight
     annotation.prompt = payload.prompt
     annotation.edit_answer = payload.edit_answer
-    try:
-        validate_question(task, payload)
-        annotation.status = SlideStatus.COMPLETED
-    except HTTPException:
-        annotation.status = SlideStatus.IN_PROGRESS
-    annotation.publication_status = "DRAFT"
+    annotation.status = SlideStatus.COMPLETED
+    annotation.publication_status = "SAVED"
     annotation.is_deleted = False
     annotation.main_label = 1
     annotation.blind_label = None
@@ -527,48 +598,35 @@ def save_annotation(
     return annotation
 
 
-@router.post("/{task_id}/slides/{slide_id}/annotations/import", response_model=list[SlideAnnotationResponse])
+@router.post("/{task_id}/slides/{slide_id}/annotations/import", response_model=list[SlideAnnotationPreview])
 def import_slide_annotations(
     task_id: int,
     slide_id: int,
     payload: SlideAnnotationBatchInput,
     current_user: MainAnnotator,
     database_session: Session = Depends(get_db),
-) -> list[SlideAnnotation]:
-    existing_annotations = list(database_session.scalars(
-        select(SlideAnnotation).where(
-            SlideAnnotation.slide_id == slide_id,
-            SlideAnnotation.is_deleted.is_(False),
-        ).order_by(SlideAnnotation.id).limit(10)
-    ))
-    try:
-        imported_annotations = []
-        for index, imported in enumerate(payload.annotations):
-            existing = existing_annotations[index] if index < len(existing_annotations) else None
-            annotation_payload = imported.model_copy(update={
-                "annotation_id": existing.id if existing else None,
-                "question": normalized_question(imported.question),
-            })
-            imported_annotations.append(save_annotation(
-                task_id,
-                slide_id,
-                annotation_payload,
-                current_user,
-                database_session,
-                commit=False,
-            ))
-        database_session.commit()
-        for annotation in imported_annotations:
-            database_session.refresh(annotation)
-        return imported_annotations
-    except Exception:
-        database_session.rollback()
-        raise
+) -> list[SlideAnnotationPreview]:
+    task = get_task(task_id, database_session)
+    slide = database_session.get(DocumentSlide, slide_id)
+    document = database_session.get(TaskDocument, slide.document_id) if slide else None
+    if slide is None or document is None or document.task_id != task_id:
+        raise HTTPException(status_code=404, detail="Slide not found.")
+    previews: list[SlideAnnotationPreview] = []
+    for imported in payload.annotations:
+        if imported.image_id != slide.image_id:
+            raise HTTPException(
+                status_code=409,
+                detail="Annotation image_id does not match the selected slide image.",
+            )
+        normalized = imported.model_copy(update={"question": normalized_question(imported.question)})
+        validate_question(task, normalized)
+        previews.append(SlideAnnotationPreview(**normalized.model_dump(exclude={"annotation_id", "image_id"})))
+    return previews
 
 
-@router.post("/{task_id}/slides/{slide_id}/generate", response_model=list[SlideAnnotationResponse])
+@router.post("/{task_id}/slides/{slide_id}/generate", response_model=list[SlideAnnotationPreview])
 def generate_slide_annotation(task_id: int, slide_id: int, payload: GenerateAnnotationInput,
-                              current_user: MainAnnotator, database_session: Session = Depends(get_db)) -> list[SlideAnnotation]:
+                              current_user: MainAnnotator, database_session: Session = Depends(get_db)) -> list[SlideAnnotationPreview]:
     task = get_task(task_id, database_session)
     if task.status not in {TaskStatus.IN_PROGRESS, TaskStatus.WAITING_FOR_DOCUMENT}:
         raise HTTPException(status_code=409, detail="This task is not accepting main annotations.")
@@ -579,11 +637,7 @@ def generate_slide_annotation(task_id: int, slide_id: int, payload: GenerateAnno
     if document is None or document.task_id != task_id:
         raise HTTPException(status_code=404, detail="Slide not found.")
     try:
-        image_bytes, _ = drive_service.download_file_bytes(
-            slide.drive_file_id, user_id=current_user.id,
-        ) if slide.drive_file_id else (
-            Path(slide.image_reference).read_bytes(), "image/png"
-        )
+        image_bytes, _ = read_image_bytes(slide, task_id, current_user.id)
         generated_items = generate_annotations(
             image_bytes,
             task.output_type.value,
@@ -592,36 +646,21 @@ def generate_slide_annotation(task_id: int, slide_id: int, payload: GenerateAnno
             category=payload.category,
             count=10,
         )
-        existing_annotations = list(database_session.scalars(
-            select(SlideAnnotation).where(
-                SlideAnnotation.slide_id == slide_id,
-                SlideAnnotation.is_deleted.is_(False),
-            ).order_by(SlideAnnotation.id).limit(10)
-        ))
-        annotation_payloads: list[SlideAnnotationInput] = []
-        for index, generated in enumerate(generated_items):
-            existing = existing_annotations[index] if index < len(existing_annotations) else None
+        previews: list[SlideAnnotationPreview] = []
+        for generated in generated_items:
             annotation_payload = SlideAnnotationInput(
-                annotation_id=existing.id if existing else None,
+                image_id=slide.image_id,
                 categories=generated.get("category", payload.category),
-                slide_type=existing.slide_type if existing else 1,
+                slide_type=1,
                 language=payload.language,
                 question=normalized_question(generated.get("question") or {}),
                 answer=str(generated.get("answer") or "").strip(),
-                insight=existing.insight if existing else None,
                 prompt=payload.prompt,
                 edit_answer=payload.edit_answer,
             )
             validate_question(task, annotation_payload)
-            annotation_payloads.append(annotation_payload)
-        annotations = [
-            save_annotation(task_id, slide_id, annotation_payload, current_user, database_session, commit=False)
-            for annotation_payload in annotation_payloads
-        ]
-        database_session.commit()
-        for annotation in annotations:
-            database_session.refresh(annotation)
-        return annotations
+            previews.append(SlideAnnotationPreview(**annotation_payload.model_dump(exclude={"annotation_id", "image_id"})))
+        return previews
     except HTTPException:
         raise
     except Exception as error:
@@ -639,16 +678,16 @@ def delete_draft_annotation(
 ) -> Response:
     task = get_task(task_id, database_session)
     if task.status not in {TaskStatus.IN_PROGRESS, TaskStatus.WAITING_FOR_DOCUMENT}:
-        raise HTTPException(status_code=409, detail="This task is not accepting draft changes.")
+        raise HTTPException(status_code=409, detail="This task is not accepting annotation changes.")
     annotation = database_session.get(SlideAnnotation, annotation_id)
     slide = database_session.get(DocumentSlide, slide_id)
     document = database_session.get(TaskDocument, slide.document_id) if slide else None
     if annotation is None or annotation.slide_id != slide_id or document is None or document.task_id != task_id:
-        raise HTTPException(status_code=404, detail="Draft annotation not found for this slide.")
-    if annotation.publication_status != "DRAFT":
-        raise HTTPException(status_code=409, detail="Published annotations cannot be deleted as drafts.")
+        raise HTTPException(status_code=404, detail="Saved annotation not found for this slide.")
+    if annotation.publication_status != "SAVED":
+        raise HTTPException(status_code=409, detail="Published annotations cannot be deleted.")
     annotation.is_deleted = True
-    annotation.publication_status = "DRAFT"
+    annotation.publication_status = "SAVED"
     remaining = database_session.scalar(select(func.count()).select_from(SlideAnnotation).where(
         SlideAnnotation.slide_id == slide_id,
         SlideAnnotation.id != annotation_id,
@@ -924,16 +963,7 @@ def get_slide_image_for_role(
     document = database_session.get(TaskDocument, slide.document_id)
     if document is None or document.task_id != task_id:
         raise HTTPException(status_code=404, detail="Slide not found.")
-    if slide.drive_file_id:
-        try:
-            content, media_type = drive_service.download_file_bytes(slide.drive_file_id, user_id=user_id)
-            return Response(content=content, media_type=media_type)
-        except (ValueError, RuntimeError) as error:
-            raise HTTPException(status_code=404, detail="Drive slide image is unavailable.") from error
-    image_path = Path(slide.image_reference).resolve()
-    if not image_path.is_relative_to(storage.task_root(task_id).resolve()) or not image_path.is_file():
-        raise HTTPException(status_code=404, detail="Slide image is not available.")
-    return Response(content=image_path.read_bytes(), media_type="image/png")
+    return image_response(slide, task_id, user_id)
 
 
 @router.post("/{task_id}/slides/{slide_id}/annotation", response_model=SlideAnnotationResponse)

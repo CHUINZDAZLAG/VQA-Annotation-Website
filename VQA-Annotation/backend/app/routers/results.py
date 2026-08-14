@@ -7,7 +7,9 @@ from sqlalchemy.orm import Session
 from app.config.database import get_db
 from app.middleware.auth import require_admin, require_user
 from app.models.annotation import AnnotationRecord
+from app.models.document import DocumentSlide, TaskDocument
 from app.models.export import TaskExport
+from app.models.slide_annotation import SlideAnnotation
 from app.models.task import Task, TaskAssignment, TaskStatus, TaskType
 from app.models.user import User
 from app.schemas.result import (
@@ -23,7 +25,8 @@ from app.schemas.result import (
     TaskStatisticsResponse,
     TypeStats,
 )
-from app.services.result_service import agreement_stats, filename, final_dataset_records, fleiss_agreement_stats, serialize_records
+from app.services.result_service import DatasetItem, agreement_stats, build_dataset_package, filename, final_dataset_records, fleiss_agreement_stats, serialize_records
+from app.services.storage_service import supabase_storage
 
 router = APIRouter(prefix="/api", tags=["task-results"])
 AdminUser = Annotated[User, Depends(require_admin)]
@@ -89,6 +92,46 @@ def _statistics(task_id: int, records: list[AnnotationRecord]) -> TaskStatistics
         short_answer=_type_stats(short_answer),
         combined=_type_stats(records),
     )
+
+
+def _dataset_items(database_session: Session, records: list[AnnotationRecord]) -> list[DatasetItem]:
+    if not records:
+        return []
+    record_ids = [record.id for record in records]
+    rows = database_session.execute(
+        select(SlideAnnotation, DocumentSlide, TaskDocument)
+        .join(DocumentSlide, DocumentSlide.id == SlideAnnotation.slide_id)
+        .join(TaskDocument, TaskDocument.id == DocumentSlide.document_id)
+        .where(SlideAnnotation.annotation_record_id.in_(record_ids))
+    ).all()
+    mappings: dict[int, list[tuple[DocumentSlide, TaskDocument]]] = {}
+    for annotation, slide, document in rows:
+        mappings.setdefault(annotation.annotation_record_id, []).append((slide, document))
+    items: list[DatasetItem] = []
+    for record in records:
+        record_mappings = mappings.get(record.id, [])
+        if len(record_mappings) != 1:
+            reason = "orphaned" if not record_mappings else "duplicated"
+            raise HTTPException(
+                status_code=409,
+                detail=f"Annotation {record.id} has an {reason} slide mapping.",
+            )
+        slide, document = record_mappings[0]
+        items.append(DatasetItem(record=record, slide=slide, document=document))
+    return items
+
+
+def _dataset_zip(database_session: Session, records: list[AnnotationRecord]) -> bytes:
+    try:
+        content, _ = build_dataset_package(
+            _dataset_items(database_session, records),
+            supabase_storage.download_image,
+        )
+        return content
+    except HTTPException:
+        raise
+    except (RuntimeError, ValueError) as error:
+        raise HTTPException(status_code=409, detail=f"Dataset export validation failed: {error}") from error
 
 
 def _global_rows(database_session: Session, task_id: int | None = None,
@@ -294,10 +337,10 @@ def export_task(task_id: int, payload: ExportRequest, current_user: AdminUser,
                 database_session: Session = Depends(get_db)) -> TaskExport:
     task = _task_or_404(database_session, task_id)
     output_format = payload.format.upper()
-    if output_format not in {"JSON", "CSV"}:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Export format must be JSON or CSV.")
+    if output_format not in {"JSON", "CSV", "ZIP"}:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Export format must be JSON, CSV, or ZIP.")
     records = final_dataset_records(_records(database_session, task_id))
-    content, _ = serialize_records(records, output_format)
+    content = _dataset_zip(database_session, records) if output_format == "ZIP" else serialize_records(records, output_format)[0]
     export = database_session.scalar(select(TaskExport).where(
         TaskExport.task_id == task.id,
         TaskExport.format == output_format,
@@ -306,7 +349,11 @@ def export_task(task_id: int, payload: ExportRequest, current_user: AdminUser,
         export = TaskExport(task_id=task.id, format=output_format)
         database_session.add(export)
     export.drive_folder_id = task.drive_folder_id
-    export.file_name = filename(task.name, output_format)
+    export.file_name = (
+        f"{'_'.join(task.name.strip().split()) or 'task'}_dataset-v1.0.zip"
+        if output_format == "ZIP"
+        else filename(task.name, output_format)
+    )
     export.status = "EXPORTED"
     # Drive upload is intentionally backend-only; metadata remains usable when Drive is not configured.
     try:
@@ -332,7 +379,10 @@ def download_export(task_id: int, export_id: int, _: AdminUser,
     if export is None or export.task_id != task.id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Export not found.")
     records = final_dataset_records(_records(database_session, task_id))
-    content, media_type = serialize_records(records, export.format)
+    if export.format == "ZIP":
+        content, media_type = _dataset_zip(database_session, records), "application/zip"
+    else:
+        content, media_type = serialize_records(records, export.format)
     return Response(content=content, media_type=media_type, headers={"Content-Disposition": f'attachment; filename="{export.file_name}"'})
 
 

@@ -56,6 +56,11 @@ class SlideResponse(BaseModel):
     drive_file_url: str | None = None
     slide_name: str
     image_reference: str
+    storage_path: str | None = None
+    width: int | None = None
+    height: int | None = None
+    file_size: int | None = None
+    mime_type: str | None = None
     image_url: str
     status: SlideStatus
     annotation: "SlideAnnotationResponse | None" = None
@@ -68,7 +73,7 @@ class SlideAnnotationResponse(BaseModel):
     id: int
     slide_id: int
     annotation_record_id: int | None = None
-    publication_status: str = "DRAFT"
+    publication_status: str = "SAVED"
     is_deleted: bool = False
     categories: int
     slide_type: int
@@ -99,6 +104,7 @@ class SlideAnnotationResponse(BaseModel):
 
 class SlideAnnotationInput(BaseModel):
     annotation_id: int | None = Field(default=None, gt=0)
+    image_id: str = Field(min_length=1, max_length=255)
     categories: int = Field(ge=0, le=4)
     slide_type: int = Field(ge=1, le=3)
     language: int = Field(ge=1, le=2)
@@ -119,6 +125,19 @@ class SlideAnnotationInput(BaseModel):
     @classmethod
     def answer_must_not_be_blank(cls, value: str) -> str:
         return value.strip()
+
+
+class SlideAnnotationPreview(BaseModel):
+    id: None = None
+    categories: int = Field(ge=0, le=4)
+    slide_type: int = Field(ge=1, le=3)
+    language: int = Field(ge=1, le=2)
+    question: dict
+    answer: str
+    insight: str | None = None
+    prompt: str | None = None
+    edit_answer: bool = True
+    status: SlideStatus = SlideStatus.NOT_STARTED
 
 
 class SlideAnnotationBatchInput(BaseModel):

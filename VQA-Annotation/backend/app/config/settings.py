@@ -25,6 +25,9 @@ class Settings(BaseSettings):
     gemini_api_key: str = ""
     gemini_model: str = "gemini-flash-latest"
     storage_root: str = "storage"
+    supabase_url: str = ""
+    supabase_service_role_key: str = ""
+    supabase_storage_bucket: str = "slide-images"
     max_pdf_size_mb: int = 0
 
     model_config = SettingsConfigDict(

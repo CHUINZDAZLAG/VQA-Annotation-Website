@@ -1,5 +1,7 @@
 import json
+import io
 import unittest
+import zipfile
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -10,12 +12,14 @@ from fastapi import HTTPException
 from oauthlib.oauth2 import OAuth2Error
 from pydantic import ValidationError
 
+from app.models.annotation import AnnotationRecord
+from app.models.document import DocumentSlide, TaskDocument
 from app.models.task import OutputType, TaskStatus
 from app.routers.auth import google_drive_callback
-from app.routers.document import PAGE_RENDER_DPI, SLIDE_NAME_PATTERN, delete_draft_annotation, generated_image_id, render_and_upload_pages, validate_question
+from app.routers.document import PAGE_RENDER_DPI, SLIDE_NAME_PATTERN, delete_draft_annotation, generated_image_id, render_and_upload_pages, save_annotation, validate_question
 from app.routers.results import google_drive_health
 from app.schemas.document import DriveDocumentSelection, DriveLinkInput, SlideAnnotationBatchInput, SlideAnnotationInput
-from app.services.result_service import filename, final_dataset_records, flatten_record, fleiss_agreement_stats, serialize_records
+from app.services.result_service import DatasetItem, build_dataset_package, document_split, filename, final_dataset_records, flatten_record, fleiss_agreement_stats, serialize_records
 from app.services.gemini_service import generate_annotation, generate_annotations
 from app.services.drive_service import _credentials, service_account_file
 from app.services.google_drive_oauth_service import (
@@ -29,6 +33,58 @@ from app.services.google_drive_oauth_service import (
 class Milestone3ValidationTests(unittest.TestCase):
     def test_pdf_render_dpi_fits_constrained_production_memory(self):
         self.assertEqual(PAGE_RENDER_DPI, 150)
+
+    def test_dataset_package_deduplicates_images_and_keeps_document_split(self):
+        document = TaskDocument(
+            id=8, task_id=7, original_filename="deck.pdf", slide_name="deck",
+            storage_reference="upload:deck.pdf", page_count=2,
+        )
+        slides = [
+            DocumentSlide(id=10, document_id=8, page_number=1, image_id="deck_Page01",
+                          slide_name="deck", image_reference="supabase:7/deck_Page01.png",
+                          storage_path="7/deck_Page01.png"),
+            DocumentSlide(id=11, document_id=8, page_number=2, image_id="deck_Page02",
+                          slide_name="deck", image_reference="supabase:7/deck_Page02.png",
+                          storage_path="7/deck_Page02.png"),
+        ]
+        records = []
+        for record_id, slide in ((20, slides[0]), (21, slides[0]), (22, slides[1])):
+            records.append(AnnotationRecord(
+                id=record_id, task_id=7, output_type="SHORT_ANSWER", image_id=slide.image_id,
+                generated_image_id=slide.image_id, slide_name="deck", question={"question_text": "What?"},
+                answer="Answer", annotation_status="SUBMITTED", page_number=slide.page_number,
+            ))
+        loader = MagicMock(return_value=b"\x89PNG\r\n\x1a\nimage")
+        content, summary = build_dataset_package([
+            DatasetItem(records[0], slides[0], document),
+            DatasetItem(records[1], slides[0], document),
+            DatasetItem(records[2], slides[1], document),
+        ], loader)
+        self.assertEqual(loader.call_count, 2)
+        self.assertEqual(summary["image_count"], 2)
+        self.assertEqual(summary["document_count"], 1)
+        split = document_split(7, 8)
+        self.assertEqual(summary["splits"][split], 3)
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            names = set(archive.namelist())
+        self.assertIn("dataset-v1.0/images/deck_Page01.png", names)
+        self.assertIn("dataset-v1.0/metadata.json", names)
+
+    def test_dataset_package_rejects_image_identity_mismatch(self):
+        document = TaskDocument(
+            id=8, task_id=7, original_filename="deck.pdf", slide_name="deck",
+            storage_reference="upload:deck.pdf", page_count=1,
+        )
+        slide = DocumentSlide(
+            id=10, document_id=8, page_number=1, image_id="deck_Page01", slide_name="deck",
+            image_reference="supabase:7/deck_Page01.png", storage_path="7/deck_Page01.png",
+        )
+        record = AnnotationRecord(
+            id=20, task_id=7, output_type="SHORT_ANSWER", image_id="other_Page01",
+            generated_image_id="other_Page01", question={"question_text": "What?"}, answer="Answer",
+        )
+        with self.assertRaisesRegex(ValueError, "image identity"):
+            build_dataset_package([DatasetItem(record, slide, document)], MagicMock())
 
     def test_drive_oauth_requests_profile_scope_returned_by_google(self):
         self.assertIn("https://www.googleapis.com/auth/userinfo.profile", DRIVE_SCOPES)
@@ -185,15 +241,15 @@ class Milestone3ValidationTests(unittest.TestCase):
         database_session.commit.assert_not_called()
 
     def test_backend_generates_stable_page_ids(self):
-        self.assertEqual(generated_image_id("cake", 1), "cake_page_01")
-        self.assertEqual(generated_image_id("cake", 10), "cake_page_10")
-        self.assertEqual(generated_image_id("cake", 100), "cake_page_100")
+        self.assertEqual(generated_image_id("cake", 1), "cake_Page01")
+        self.assertEqual(generated_image_id("cake", 10), "cake_Page10")
+        self.assertEqual(generated_image_id("cake", 100), "cake_Page100")
 
-    @patch("app.routers.document.drive_service.upload_page")
-    def test_pdf_pipeline_uploads_every_page_incrementally(self, upload_page):
-        upload_page.side_effect = [
-            {"id": "page-1", "webViewLink": "drive://page-1", "created": True},
-            {"id": "page-2", "webViewLink": "drive://page-2", "created": True},
+    @patch("app.routers.document.supabase_storage.upload_image")
+    def test_pdf_pipeline_uploads_every_page_incrementally(self, upload_image):
+        upload_image.side_effect = [
+            "42/deck_Page01.png",
+            "42/deck_Page02.png",
         ]
         with TemporaryDirectory() as directory:
             pdf_path = Path(directory) / "two-pages.pdf"
@@ -202,18 +258,21 @@ class Milestone3ValidationTests(unittest.TestCase):
             pdf.new_page()
             pdf.save(pdf_path)
             pdf.close()
-            pages = render_and_upload_pages(pdf_path, "deck", "destination")
-        self.assertEqual([page[1] for page in pages], ["deck_page_01", "deck_page_02"])
+            pages = render_and_upload_pages(pdf_path, "deck", 42)
+        self.assertEqual([page[1] for page in pages], ["deck_Page01", "deck_Page02"])
         self.assertEqual(
-            [call.args[:2] for call in upload_page.call_args_list],
-            [("destination", "deck_page_01.png"), ("destination", "deck_page_02.png")],
+            [call.args[:2] for call in upload_image.call_args_list],
+            [(42, "deck_Page01"), (42, "deck_Page02")],
         )
+        self.assertEqual([page[2]["storage_path"] for page in pages], [
+            "42/deck_Page01.png", "42/deck_Page02.png",
+        ])
 
-    @patch("app.routers.document.drive_service.delete_files")
-    @patch("app.routers.document.drive_service.upload_page")
-    def test_pdf_pipeline_cleans_only_new_files_after_partial_failure(self, upload_page, delete_files):
-        upload_page.side_effect = [
-            {"id": "new-page-1", "webViewLink": "drive://page-1", "created": True},
+    @patch("app.routers.document.supabase_storage.delete_images")
+    @patch("app.routers.document.supabase_storage.upload_image")
+    def test_pdf_pipeline_cleans_only_new_files_after_partial_failure(self, upload_image, delete_images):
+        upload_image.side_effect = [
+            "42/deck_Page01.png",
             RuntimeError("upload failed"),
         ]
         with TemporaryDirectory() as directory:
@@ -224,8 +283,8 @@ class Milestone3ValidationTests(unittest.TestCase):
             pdf.save(pdf_path)
             pdf.close()
             with self.assertRaisesRegex(RuntimeError, "Page 2"):
-                render_and_upload_pages(pdf_path, "deck", "destination")
-        delete_files.assert_called_once_with(["new-page-1"])
+                render_and_upload_pages(pdf_path, "deck", 42)
+        delete_images.assert_called_once_with(["42/deck_Page01.png"])
 
     def test_slide_name_rejects_paths_and_invalid_characters(self):
         self.assertIsNotNone(SLIDE_NAME_PATTERN.fullmatch("Training01"))
@@ -235,14 +294,35 @@ class Milestone3ValidationTests(unittest.TestCase):
 
     def test_annotation_schema_enforces_metadata_bounds(self):
         with self.assertRaises(ValidationError):
-            SlideAnnotationInput(categories=5, slide_type=1, language=1, question={}, answer="A")
+            SlideAnnotationInput(image_id="deck_Page01", categories=5, slide_type=1, language=1, question={}, answer="A")
         with self.assertRaises(ValidationError):
-            SlideAnnotationInput(categories=1, slide_type=4, language=1, question={}, answer="A")
+            SlideAnnotationInput(image_id="deck_Page01", categories=1, slide_type=4, language=1, question={}, answer="A")
         with self.assertRaises(ValidationError):
-            SlideAnnotationInput(categories=1, slide_type=1, language=3, question={}, answer="A")
+            SlideAnnotationInput(image_id="deck_Page01", categories=1, slide_type=1, language=3, question={}, answer="A")
+
+    @patch("app.routers.document.get_task")
+    def test_save_rejects_image_id_mismatch_before_writing(self, get_task):
+        get_task.return_value = SimpleNamespace(
+            status=TaskStatus.IN_PROGRESS,
+            output_type=OutputType.SHORT_ANSWER,
+        )
+        slide = SimpleNamespace(id=3, document_id=8, image_id="deck_Page01")
+        document = SimpleNamespace(id=8, task_id=7)
+        database_session = MagicMock()
+        database_session.get.side_effect = lambda model, identifier: slide if identifier == 3 else document
+        payload = SlideAnnotationInput(
+            image_id="other_Page01", categories=1, slide_type=1, language=1,
+            question={"question_text": "What is shown?"}, answer="A chart",
+        )
+        with self.assertRaisesRegex(HTTPException, "image_id does not match"):
+            save_annotation(7, 3, payload, SimpleNamespace(id=5), database_session)
+        database_session.add.assert_not_called()
+        database_session.flush.assert_not_called()
+        database_session.commit.assert_not_called()
 
     def test_manual_json_batch_requires_exactly_ten_labels(self):
         annotation = SlideAnnotationInput(
+            image_id="deck_Page01",
             categories=0,
             slide_type=1,
             language=1,
@@ -257,6 +337,7 @@ class Milestone3ValidationTests(unittest.TestCase):
     def test_multiple_choice_requires_all_options_and_valid_answer(self):
         task = SimpleNamespace(output_type=OutputType.MULTIPLE_CHOICE)
         payload = SlideAnnotationInput(
+            image_id="deck_Page01",
             categories=4,
             slide_type=2,
             language=1,
@@ -270,7 +351,7 @@ class Milestone3ValidationTests(unittest.TestCase):
 
     def test_short_answer_requires_question_text_and_answer(self):
         task = SimpleNamespace(output_type=OutputType.SHORT_ANSWER)
-        payload = SlideAnnotationInput(categories=1, slide_type=1, language=2, question={"question_text": "Revenue"}, answer="$2.5m")
+        payload = SlideAnnotationInput(image_id="deck_Page01", categories=1, slide_type=1, language=2, question={"question_text": "Revenue"}, answer="$2.5m")
         with self.assertRaises(Exception):
             validate_question(task, payload)
         valid_payload = payload.model_copy(update={"question": {"question_text": "What is the revenue?"}})

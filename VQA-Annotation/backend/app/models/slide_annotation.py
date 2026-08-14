@@ -15,7 +15,7 @@ class SlideAnnotation(Base):
     annotation_record_id: Mapped[int | None] = mapped_column(
         ForeignKey("annotation_records.id", ondelete="SET NULL"), nullable=True, index=True
     )
-    publication_status: Mapped[str] = mapped_column(String(16), default="DRAFT", nullable=False, index=True)
+    publication_status: Mapped[str] = mapped_column(String(16), default="SAVED", nullable=False, index=True)
     is_deleted: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_by: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     categories: Mapped[int] = mapped_column(Integer, nullable=False)

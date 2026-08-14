@@ -115,13 +115,13 @@ export const authService = {
   setTaskDriveFolder: (taskId, driveFolderId) => request(`/api/admin/tasks/${taskId}/drive-folder`, {
     method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ drive_folder_id: driveFolderId }),
   }, 'admin'),
-  downloadTaskExport: async (taskId, exportId) => {
+  downloadTaskExport: async (taskId, exportId, fileName = 'task-export') => {
     const response = await fetch(apiUrl(`/api/admin/tasks/${taskId}/exports/${exportId}/download`), {
       headers: { Authorization: `Bearer ${localStorage.getItem(portalKeys.admin.access)}` },
     });
     if (!response.ok) throw new Error('Could not download export.');
     const url = URL.createObjectURL(await response.blob());
-    const link = document.createElement('a'); link.href = url; link.download = 'task-export'; link.click(); URL.revokeObjectURL(url);
+    const link = document.createElement('a'); link.href = url; link.download = fileName; link.click(); URL.revokeObjectURL(url);
   },
   listTasks: () => request('/api/tasks'),
   getTask: (taskId) => request(`/api/tasks/${taskId}`),
@@ -183,8 +183,8 @@ export const authService = {
     return URL.createObjectURL(await response.blob());
   },
   submitTaskAnnotation: (taskId) => request(`/api/tasks/${taskId}/submit`, { method: 'POST' }),
-  async getTaskSlideImage(taskId, slideId) {
-    const response = await fetch(apiUrl(`/api/tasks/${taskId}/slides/${slideId}/image`), {
+  async getTaskImage(taskId, imageId) {
+    const response = await fetch(apiUrl(`/api/tasks/${taskId}/images/${encodeURIComponent(imageId)}`), {
       headers: { Authorization: `Bearer ${localStorage.getItem(portalKeys.user.access)}` },
     });
     if (!response.ok) throw new Error('Could not load slide image.');

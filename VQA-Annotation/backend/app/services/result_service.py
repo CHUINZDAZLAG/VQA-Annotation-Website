@@ -1,11 +1,15 @@
 import csv
+import hashlib
 import io
 import json
 import math
+import zipfile
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Any
 
 from app.models.annotation import AnnotationRecord
+from app.models.document import DocumentSlide, TaskDocument
 
 
 EXPORT_COLUMNS = [
@@ -21,6 +25,96 @@ EXPORT_COLUMNS = [
     "reviewer_reject_note", "annotation_status", "created_by", "page_number",
     "created_at", "updated_at", "option_a", "option_b", "option_c", "option_d",
 ]
+
+DATASET_VERSION = "1.0"
+
+
+@dataclass(frozen=True)
+class DatasetItem:
+    record: AnnotationRecord
+    slide: DocumentSlide
+    document: TaskDocument
+
+
+def document_split(task_id: int, document_id: int) -> str:
+    bucket = int(hashlib.sha256(f"{task_id}:{document_id}".encode("utf-8")).hexdigest()[:8], 16) % 100
+    if bucket < 80:
+        return "train"
+    if bucket < 90:
+        return "validation"
+    return "test"
+
+
+def validate_dataset_item(item: DatasetItem) -> None:
+    record, slide, document = item.record, item.slide, item.document
+    if record.task_id != document.task_id:
+        raise ValueError(f"Annotation {record.id} is mapped to a document from another task.")
+    if record.image_id != slide.image_id or record.generated_image_id not in {None, slide.image_id}:
+        raise ValueError(f"Annotation {record.id} image identity does not match its slide.")
+    if slide.document_id != document.id:
+        raise ValueError(f"Annotation {record.id} is mapped to an invalid document slide.")
+    if not slide.storage_path:
+        raise ValueError(f"Image {slide.image_id} has no Supabase Storage object path.")
+    if any(part in slide.image_id for part in ("/", "\\", "..")):
+        raise ValueError(f"Image {slide.image_id} cannot be used as a dataset filename.")
+
+
+def build_dataset_package(
+    items: Iterable[DatasetItem],
+    image_loader,
+    version: str = DATASET_VERSION,
+) -> tuple[bytes, dict[str, Any]]:
+    dataset_items = list(items)
+    seen_records: set[int] = set()
+    image_bytes: dict[str, bytes] = {}
+    split_rows: dict[str, list[dict[str, Any]]] = {"train": [], "validation": [], "test": []}
+    for item in dataset_items:
+        validate_dataset_item(item)
+        if item.record.id in seen_records:
+            raise ValueError(f"Annotation {item.record.id} has duplicate slide mappings.")
+        seen_records.add(item.record.id)
+        if item.slide.image_id not in image_bytes:
+            content = image_loader(item.slide.storage_path)
+            if not content.startswith(b"\x89PNG\r\n\x1a\n"):
+                raise ValueError(f"Image {item.slide.image_id} is not a valid PNG object.")
+            image_bytes[item.slide.image_id] = content
+        split = document_split(item.record.task_id, item.document.id)
+        row = flatten_record(item.record)
+        row["image_path"] = f"images/{item.slide.image_id}.png"
+        row["document_id"] = item.document.id
+        row["split"] = split
+        split_rows[split].append(row)
+    summary = {
+        "dataset_version": version,
+        "annotation_count": len(dataset_items),
+        "image_count": len(image_bytes),
+        "document_count": len({item.document.id for item in dataset_items}),
+        "splits": {name: len(rows) for name, rows in split_rows.items()},
+        "validation": {"mapping_errors": 0, "missing_images": 0, "duplicate_mappings": 0},
+    }
+    root = f"dataset-v{version}"
+    stream = io.BytesIO()
+    with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for image_id, content in sorted(image_bytes.items()):
+            archive.writestr(f"{root}/images/{image_id}.png", content)
+        for split, rows in split_rows.items():
+            archive.writestr(
+                f"{root}/{split}.json",
+                json.dumps(rows, ensure_ascii=False, indent=2, default=str).encode("utf-8"),
+            )
+        archive.writestr(
+            f"{root}/metadata.json",
+            json.dumps(summary, ensure_ascii=False, indent=2).encode("utf-8"),
+        )
+        archive.writestr(
+            f"{root}/README.md",
+            (
+                f"# VQA Dataset v{version}\n\n"
+                "Each annotation references an exact PNG under `images/` by `image_path`. "
+                "Splits are assigned at document level so pages from one deck never cross splits.\n"
+            ).encode("utf-8"),
+        )
+    return stream.getvalue(), summary
 
 
 def decision(record: AnnotationRecord, role: str) -> int | None:
