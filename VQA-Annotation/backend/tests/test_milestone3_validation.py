@@ -19,6 +19,7 @@ from app.services.result_service import filename, final_dataset_records, flatten
 from app.services.gemini_service import generate_annotation, generate_annotations
 from app.services.drive_service import _credentials, service_account_file
 from app.services.google_drive_oauth_service import (
+    DRIVE_SCOPES,
     authorization_url,
     decrypt_refresh_token,
     encrypt_refresh_token,
@@ -26,6 +27,9 @@ from app.services.google_drive_oauth_service import (
 
 
 class Milestone3ValidationTests(unittest.TestCase):
+    def test_drive_oauth_requests_profile_scope_returned_by_google(self):
+        self.assertIn("https://www.googleapis.com/auth/userinfo.profile", DRIVE_SCOPES)
+
     @patch("app.routers.auth.frontend_redirect", return_value="https://frontend.test/annotator?drive=error")
     @patch("app.routers.auth.complete_authorization", side_effect=OAuth2Error(description="invalid_client"))
     def test_drive_oauth_callback_redirects_token_exchange_errors(self, _, frontend_redirect):

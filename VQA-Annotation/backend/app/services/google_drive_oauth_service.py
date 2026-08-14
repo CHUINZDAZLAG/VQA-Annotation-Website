@@ -16,6 +16,7 @@ from app.models.google_drive import GoogleDriveConnection, GoogleDriveOAuthState
 DRIVE_SCOPES = (
     "openid",
     "https://www.googleapis.com/auth/userinfo.email",
+    "https://www.googleapis.com/auth/userinfo.profile",
     "https://www.googleapis.com/auth/drive",
 )
 STATE_TTL_MINUTES = 10
